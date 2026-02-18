@@ -16,7 +16,7 @@ final class FlutterGodotAndroid extends FlutterGodotPlatform {
 
   final EventChannel eventStream = const EventChannel("flutter_godot_event");
 
-  /// 发送数据到 Godot
+  /// Send data to Godot
   @override
   Future<bool> sendDataToGodot({required String data}) {
     return methodChannel
@@ -25,7 +25,7 @@ final class FlutterGodotAndroid extends FlutterGodotPlatform {
         .catchError((error) => throw FlutterError(error.toString()));
   }
 
-  /// 监听 Godot 发送来的数据
+  /// Listen for data sent from Godot
   @override
   StreamSubscription<dynamic> listenGodotData({
     required GodotListenCallback callback,
@@ -37,16 +37,16 @@ final class FlutterGodotAndroid extends FlutterGodotPlatform {
             callback(event["data"]);
             break;
           default:
-            debugPrint("未知事件类型: ${event["type"]}");
+            debugPrint("Unknown event type: ${event["type"]}");
             break;
         }
       } else {
-        debugPrint("未知事件: $event");
+        debugPrint("Unknown event: $event");
       }
     }, onError: (error) => debugPrint(error.toString()));
   }
 
-  /// 游戏播放器
+  /// Game player widget
   @override
   Widget ofPlayer({String? name, String? package}) {
     return GodotPlayer(name: name, package: package);
