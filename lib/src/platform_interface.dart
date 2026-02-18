@@ -21,16 +21,16 @@ abstract base class FlutterGodotPlatform extends PlatformInterface {
   }
 
   Future<bool> sendDataToGodot({required String data}) {
-    throw UnimplementedError('接口 sendDataToGodot() 未实现.');
+    throw UnimplementedError('Interface sendDataToGodot() is not implemented.');
   }
 
   StreamSubscription<dynamic> listenGodotData({
     required GodotListenCallback callback,
   }) {
-    throw UnimplementedError('接口 listenGodotData() 未实现.');
+    throw UnimplementedError('Interface listenGodotData() is not implemented.');
   }
 
   Widget ofPlayer({String? name, String? package}) {
-    throw UnimplementedError('接口 ofPlayer() 未实现.');
+    throw UnimplementedError('Interface ofPlayer() is not implemented.');
   }
 }
