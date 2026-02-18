@@ -78,9 +78,9 @@ class _HomePageState extends State<HomePage> {
       floatingActionButtonLocation: FloatingActionButtonLocation.centerFloat,
       floatingActionButton: FloatingActionButton.extended(
         onPressed: () {
-          FlutterGodot.sendDataToGodot(data: '这是Flutter发送到Godot的数据.');
+          FlutterGodot.sendDataToGodot(data: 'This is data sent from Flutter to Godot.');
         },
-        label: const Text('发送消息到Godot'),
+        label: const Text('Send message to Godot'),
         icon: const Icon(Icons.send),
       ),
     );
