@@ -30,6 +30,16 @@ abstract base class FlutterGodotPlatform extends PlatformInterface {
     throw UnimplementedError('Interface listenGodotData() is not implemented.');
   }
 
+  Future<void> forwardInputEvent({
+    required double x,
+    required double y,
+    required String type,
+    required int button,
+    double pressure = 1.0,
+  }) {
+    throw UnimplementedError('Interface forwardInputEvent() is not implemented.');
+  }
+
   Widget ofPlayer({String? name, String? package}) {
     throw UnimplementedError('Interface ofPlayer() is not implemented.');
   }
