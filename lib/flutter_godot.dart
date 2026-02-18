@@ -10,34 +10,34 @@ import 'src/platform_interface.dart';
 import 'src/listen_callback.dart';
 import 'src/unsupported.dart';
 
-/// 导出监听数据的回调
+/// Export the callback for listening to data
 export 'src/listen_callback.dart';
 
-/// 不支持的平台做兼容处理
+/// Compatibility handling for unsupported platforms
 part 'flutter_godot_compat.dart';
 
 final class FlutterGodot {
   const FlutterGodot._();
 
-  /// 注册 flutter_godot 插件.
-  /// 插件注册由 Flutter 框架接管请勿手动注册.
+  /// Register the flutter_godot plugin.
+  /// Plugin registration is managed by the Flutter framework, please do not register manually.
   static void registerWith() {
     FlutterGodotPlatform.instance = FlutterGodotAndroid();
   }
 
-  /// 发送数据到 Godot
+  /// Send data to Godot
   static Future<bool> sendDataToGodot({required String data}) {
     return FlutterGodotPlatform.instance.sendDataToGodot(data: data);
   }
 
-  /// 监听 Godot 发送来的数据
+  /// Listen for data sent from Godot
   static StreamSubscription<dynamic> listenGodotData({
     required GodotListenCallback callback,
   }) {
     return FlutterGodotPlatform.instance.listenGodotData(callback: callback);
   }
 
-  /// 游戏播放器
+  /// Game player widget
   static Widget ofPlayer({String? name, String? package}) {
     return FlutterGodotPlatform.instance.ofPlayer(name: name, package: package);
   }
