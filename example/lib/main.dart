@@ -47,21 +47,24 @@ class HomePage extends StatefulWidget {
 }
 
 class _HomePageState extends State<HomePage> {
-  _HomePageState();
-
-  StreamSubscription? _eventSubscription;
+  StreamSubscription<dynamic>? _sub;
+  int _msgCount = 0;
+  String _lastMsg = '';
 
   @override
   void initState() {
     super.initState();
-    _eventSubscription = FlutterGodot.listenGodotData(
-      callback: (data) => debugPrint('Flutter: $data'),
-    );
+    _sub = FlutterGodot.listenGodotData(callback: (String data) {
+      setState(() {
+        _msgCount++;
+        _lastMsg = data;
+      });
+    });
   }
 
   @override
   void dispose() {
-    _eventSubscription?.cancel();
+    _sub?.cancel();
     super.dispose();
   }
 
@@ -69,14 +72,33 @@ class _HomePageState extends State<HomePage> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(title: const Text('Flutter Godot Example')),
-      body: Card.outlined(
-        margin: const EdgeInsets.all(16),
-        child: ClipRRect(
-          borderRadius: const BorderRadius.all(Radius.circular(12.0)),
-          child: Platform.isAndroid
-              ? FlutterGodot.ofPlayer()
-              : FlutterGodot.ofPlayer(name: 'assets/godot_game.pck'),
-        ),
+      body: Column(
+        children: [
+          Expanded(
+            child: Card.outlined(
+              margin: const EdgeInsets.all(16),
+              child: ClipRRect(
+                borderRadius: const BorderRadius.all(Radius.circular(12.0)),
+                child: Platform.isAndroid
+                    ? FlutterGodot.ofPlayer()
+                    : FlutterGodot.ofPlayer(name: 'assets/godot_game.pck'),
+              ),
+            ),
+          ),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16),
+            child: Card.filled(
+              child: ListTile(
+                leading: const Icon(Icons.message),
+                title: Text(_msgCount == 0
+                    ? 'No messages from Godot yet'
+                    : _lastMsg),
+                subtitle: Text('$_msgCount message${_msgCount == 1 ? '' : 's'} received'),
+              ),
+            ),
+          ),
+          const SizedBox(height: 80),
+        ],
       ),
       floatingActionButtonLocation: FloatingActionButtonLocation.centerFloat,
       floatingActionButton: FloatingActionButton.extended(

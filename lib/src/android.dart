@@ -16,6 +16,18 @@ final class FlutterGodotAndroid extends FlutterGodotPlatform {
 
   final EventChannel eventStream = const EventChannel("flutter_godot_event");
 
+  /// Single broadcast stream shared by all listeners
+  late final Stream<String> _godotDataStream = eventStream
+      .receiveBroadcastStream()
+      .expand<String>((dynamic event) {
+        if (event is Map && event["type"] == "takeString") {
+          return [event["data"] as String];
+        }
+        debugPrint("Unknown event: $event");
+        return [];
+      })
+      .asBroadcastStream();
+
   /// Send data to Godot
   @override
   Future<bool> sendDataToGodot({required String data}) {
@@ -30,20 +42,7 @@ final class FlutterGodotAndroid extends FlutterGodotPlatform {
   StreamSubscription<dynamic> listenGodotData({
     required GodotListenCallback callback,
   }) {
-    return eventStream.receiveBroadcastStream().listen((dynamic event) {
-      if (event is Map && event["type"] != null) {
-        switch (event["type"]) {
-          case "takeString":
-            callback(event["data"]);
-            break;
-          default:
-            debugPrint("Unknown event type: ${event["type"]}");
-            break;
-        }
-      } else {
-        debugPrint("Unknown event: $event");
-      }
-    }, onError: (error) => debugPrint(error.toString()));
+    return _godotDataStream.listen(callback);
   }
 
   /// Game player widget
