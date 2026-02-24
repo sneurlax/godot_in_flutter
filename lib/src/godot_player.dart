@@ -8,6 +8,7 @@ import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
 
 import '../flutter_godot.dart';
+import 'platform_interface.dart';
 
 final class GodotPlayer extends StatefulWidget {
   const GodotPlayer({super.key, this.name, this.package});
@@ -24,11 +25,17 @@ final class GodotPlayer extends StatefulWidget {
 class _GodotPlayerState extends State<GodotPlayer> {
   StreamSubscription<dynamic>? _godotDataSubscription;
   bool _isReady = false;
+  bool _linuxInitStarted = false;
+  Size? _lastSize;
+  Offset? _lastPosition;
 
   @override
   void initState() {
     super.initState();
-    _setupGodotListener();
+    if (!Platform.isLinux) {
+      _setupGodotListener();
+    }
+    // Linux: defer initialization until we know the widget size
   }
 
   /// Set up listener for Godot data stream (triggers initialization)
@@ -38,7 +45,6 @@ class _GodotPlayerState extends State<GodotPlayer> {
       callback: (String data) {
         if (mounted) {
           debugPrint('[GodotPlayer] Godot data received: $data');
-          // Mark as ready once we receive first data
           if (!_isReady) {
             setState(() => _isReady = true);
           }
@@ -47,22 +53,65 @@ class _GodotPlayerState extends State<GodotPlayer> {
     );
   }
 
+  /// Called after Linux layout is known to create embed window and start Godot
+  void _onLinuxLayout(BuildContext context, BoxConstraints constraints) {
+    if (!mounted) return;
+
+    final renderBox = context.findRenderObject() as RenderBox?;
+    if (renderBox == null || !renderBox.hasSize) return;
+
+    final size = renderBox.size;
+    final position = renderBox.localToGlobal(Offset.zero);
+
+    // First time: set pending size and trigger initialization
+    if (!_linuxInitStarted) {
+      _linuxInitStarted = true;
+      _lastSize = size;
+      _lastPosition = position;
+
+      final platform = FlutterGodotPlatform.instance;
+      if (platform is FlutterGodotLinux) {
+        platform.setEmbedSize(size, position);
+      }
+
+      _setupGodotListener();
+      return;
+    }
+
+    // Subsequent: update embed window if size/position changed
+    if (_lastSize != size || _lastPosition != position) {
+      _lastSize = size;
+      _lastPosition = position;
+
+      final platform = FlutterGodotPlatform.instance;
+      if (platform is FlutterGodotLinux) {
+        platform.updateEmbedWindow(
+          position.dx, position.dy, size.width, size.height,
+        );
+      }
+    }
+  }
+
   @override
   void dispose() {
     debugPrint('[GodotPlayer] Disposing...');
     _godotDataSubscription?.cancel();
+    if (Platform.isLinux) {
+      final platform = FlutterGodotPlatform.instance;
+      if (platform is FlutterGodotLinux) {
+        platform.destroyEmbedWindow();
+      }
+    }
     super.dispose();
   }
 
   /// Handle pointer events (touch/mouse) and forward to Godot
   Future<void> _handlePointerEvent(PointerEvent event) async {
-    // Extract event information
     final x = event.localPosition.dx;
     final y = event.localPosition.dy;
 
-    // Determine event type and button
     String eventType = 'move';
-    int button = -1; // No button by default
+    int button = -1;
 
     if (event is PointerDownEvent) {
       eventType = 'down';
@@ -72,16 +121,13 @@ class _GodotPlayerState extends State<GodotPlayer> {
       button = _getButtonFromPointerEvent(event);
     } else if (event is PointerMoveEvent) {
       eventType = 'move';
-      // Try to determine button from pressure (for touch)
       if (event.pressure > 0) {
-        button = 0; // Left button for touch
+        button = 0;
       }
     }
 
-    // Get pressure value
     final pressure = event.pressure > 0 ? event.pressure : 1.0;
 
-    // Forward to Godot
     try {
       await FlutterGodot.forwardInputEvent(
         x: x,
@@ -90,12 +136,6 @@ class _GodotPlayerState extends State<GodotPlayer> {
         button: button,
         pressure: pressure,
       );
-      if (kDebugMode) {
-        debugPrint(
-          '[GodotPlayer] Input event forwarded: type=$eventType, x=$x, y=$y, '
-          'button=$button, pressure=$pressure',
-        );
-      }
     } catch (error) {
       if (kDebugMode) {
         debugPrint('[GodotPlayer] Failed to forward input event: $error');
@@ -106,21 +146,19 @@ class _GodotPlayerState extends State<GodotPlayer> {
   /// Map pointer button to integer code
   int _getButtonFromPointerEvent(PointerEvent event) {
     if (event is PointerDownEvent || event is PointerUpEvent) {
-      // Check the kind of pointer to determine button
       switch (event.kind) {
         case PointerDeviceKind.mouse:
-          // For mouse events, check the buttons
           final buttons = event.buttons;
-          if (buttons == kPrimaryButton) return 0; // Left
-          if (buttons == kSecondaryButton) return 1; // Right
-          if (buttons == kTertiaryButton) return 2; // Middle
+          if (buttons == kPrimaryButton) return 0;
+          if (buttons == kSecondaryButton) return 1;
+          if (buttons == kTertiaryButton) return 2;
           break;
         case PointerDeviceKind.touch:
         case PointerDeviceKind.stylus:
         case PointerDeviceKind.invertedStylus:
         case PointerDeviceKind.trackpad:
         case PointerDeviceKind.unknown:
-          return 0; // Default to left button for touch/stylus
+          return 0;
       }
     }
     return -1;
@@ -128,32 +166,38 @@ class _GodotPlayerState extends State<GodotPlayer> {
 
   @override
   Widget build(BuildContext context) {
-    // Android: use platform view directly
     if (Platform.isAndroid) {
       return _buildAndroidView();
     }
 
-    // Linux: show loading or ready state
     if (Platform.isLinux) {
-      if (_isReady) {
-        return _buildLinuxWidget();
-      } else {
-        return _buildLoadingWidget();
-      }
+      return _buildLinuxView();
     }
 
-    // Unsupported platform
     return _buildUnsupportedWidget();
   }
 
-  /// Build Android native view
-  Widget _buildAndroidView() {
-    // Wrap with Listener to capture input events on Android
+  /// Build Linux embedded view using X11 reparenting
+  Widget _buildLinuxView() {
     return Listener(
       onPointerDown: _handlePointerEvent,
       onPointerUp: _handlePointerEvent,
       onPointerMove: _handlePointerEvent,
-      child: PlatformViewLink(
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            _onLinuxLayout(context, constraints);
+          });
+          // Transparent container - Godot renders via X11 child window
+          return Container(color: Colors.black);
+        },
+      ),
+    );
+  }
+
+  /// Build Android native view (touch handled natively by Godot)
+  Widget _buildAndroidView() {
+    return PlatformViewLink(
         surfaceFactory:
             (BuildContext context, PlatformViewController controller) {
               return AndroidViewSurface(
@@ -183,77 +227,6 @@ class _GodotPlayerState extends State<GodotPlayer> {
             ..create();
         },
         viewType: GodotPlayer._viewType,
-      ),
-    );
-  }
-
-  /// Build loading widget for Linux during initialization
-  Widget _buildLoadingWidget() {
-    return Container(
-      color: Colors.grey[900],
-      child: Center(
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            const SizedBox(
-              width: 50,
-              height: 50,
-              child: CircularProgressIndicator(
-                strokeWidth: 3,
-              ),
-            ),
-            const SizedBox(height: 16),
-            Text(
-              'Godot loading...',
-              style: Theme.of(context).textTheme.bodyLarge?.copyWith(
-                    color: Colors.white,
-                  ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  /// Build Linux widget once Godot is ready
-  Widget _buildLinuxWidget() {
-    // Wrap with Listener to capture input events on Linux
-    return Listener(
-      onPointerDown: _handlePointerEvent,
-      onPointerUp: _handlePointerEvent,
-      onPointerMove: _handlePointerEvent,
-      child: Container(
-        color: Colors.black,
-        child: Center(
-          child: Column(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              Container(
-                padding: const EdgeInsets.all(24),
-                decoration: BoxDecoration(
-                  border: Border.all(color: Colors.blue, width: 2),
-                  borderRadius: BorderRadius.circular(8),
-                ),
-                child: Text(
-                  'Godot Game [Linux]',
-                  style: Theme.of(context).textTheme.headlineSmall?.copyWith(
-                        color: Colors.blue,
-                        fontFamily: 'Courier',
-                      ),
-                ),
-              ),
-              const SizedBox(height: 16),
-              Text(
-                widget.name != null ? 'Asset: ${widget.name}' : 'Ready',
-                style: const TextStyle(
-                  color: Colors.grey,
-                  fontSize: 12,
-                ),
-              ),
-            ],
-          ),
-        ),
-      ),
     );
   }
 
