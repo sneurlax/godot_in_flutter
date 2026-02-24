@@ -1,5 +1,7 @@
 # flutter_godot
 
+README Language: [简体中文](https://github.com/wyq0918dev/flutter_godot/blob/master/README.md) [English](https://github.com/wyq0918dev/flutter_godot/blob/master/README.en.md)
+
 The `flutter_godot` plugin allows you to embed Godot games as widgets into Flutter applications with support for two-way communication.
 
 ![Pub Version](https://img.shields.io/pub/v/flutter_godot?style=flat-square&logo=dart&logoColor=white&label=Pub%20Version&color=blue)
@@ -10,47 +12,75 @@ The `flutter_godot` plugin allows you to embed Godot games as widgets into Flutt
 
 ## Version Compatibility
 
-flutter_godot Plugin Version | Flutter Version | Godot Engine Version
+flutter_godot Plugin Version | Flutter Version | Godot Engine Version | Platforms
+---- | ---- | ---- | ----
+0.0.3+linux | 3.35 | 4.5.x | Linux (tested)
+
+## Platform Support
+
+Platform | Status | IPC
 ---- | ---- | ----
-0.0.1 | 3.32 | 4.4.1
-0.0.2 | 3.32 | 4.4.1
-0.0.3 | 3.35 | 4.4.1
+Linux | Tested, working | File-based IPC
+macOS | Compatibility stub | —
+Windows | Compatibility stub | —
+iOS | Compatibility stub | —
+Web | Compatibility stub | —
+
+## Linux Support
+
+Linux requires **Godot 4.5 or later** (tested with 4.5.x). The plugin launches Godot as a subprocess and communicates via file-based IPC.
+
+### Godot Binary
+
+The Godot binary (`example/assets/bin/godot`) is **not checked into version control** (~130 MB). To set it up:
+
+```bash
+cd example
+./DOWNLOAD_GODOT.sh
+```
+
+Or download manually from https://godotengine.org/download/linux.
+
+### Exporting the Godot Project
+
+After modifying `example/godot_project/main.gd`, re-export the `.pck`:
+
+```bash
+cd example/godot_project
+../assets/bin/godot --export-pack "Linux/X11" game.pck --headless
+cp game.pck ../assets/godot_game.pck
+```
+
+The preset "Linux/X11" is defined in `export_presets.cfg`. The exported `godot_game.pck` is bundled as a Flutter asset.
 
 ## Usage
 
-1. Create a new Flutter project or use an existing one.
-
-2. Add the dependency to `pubspec.yaml`
+1. Add the dependency to `pubspec.yaml`
 
     ```yaml
     dependencies:
       flutter_godot: ^latest
     ```
 
-3. Get the dependencies
+2. Get the dependencies
 
     ```shell
     flutter pub get
     ```
 
-4. Import the dependency in your code
+3. Import the dependency in your code
 
     ```dart
     import 'package:flutter_godot/flutter_godot.dart';
     ```
 
-5. The Godot project supports two development modes:
+4. Manage the Godot project separately, export the `.pck` package, and place it in the Flutter project's `assets` folder.
 
-    - **Integrated Mode**: Create an `assets` folder in the Android platform project of your Flutter project (`android\app\src\main\assets`) and create or place your existing Godot project within it.
+5. Implement Flutter logic in [main.dart](https://github.com/wyq0918dev/flutter_godot/blob/master/example/lib/main.dart)
 
-    - **Standalone Mode**: Manage your Godot project separately, export it as a `.pck` or `.zip` package, place it in the `assets` folder of your Flutter project, and specify the exported package path and filename in your code.
-
-6. Implement Flutter logic in [main.dart](https://github.com/wyq0918dev/flutter_godot/blob/master/example/lib/main.dart) (click to view complete source code)
-
-7. Implement Godot logic in [main.gd](https://github.com/wyq0918dev/flutter_godot/blob/master/example/android/app/src/main/assets/main.gd) (click to view complete source code)
+6. Implement Godot logic in [main.gd](https://github.com/wyq0918dev/flutter_godot/blob/master/example/godot_project/main.gd)
 
 ## Known Issues
 
-- Since Godot only provides Android platform libraries officially, this plugin only supports the Android platform. Compatibility handling is provided for other platforms and will not cause the app to crash.
-- Due to Flutter platform component limitations, HotRestart will cause Godot not to display. Please use HotReload instead or recompile the app.
-- There is a rare crash (Bug) when reopening the app after exiting.
+- Due to Flutter platform component limitations, HotRestart will cause Godot not to display. Use HotReload or recompile.
+- On Linux, Godot 4.5's `StreamPeerTCP` cannot read socket data due to a framework bug. File-based IPC is used instead.
