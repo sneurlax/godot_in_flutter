@@ -2,16 +2,22 @@
 library;
 
 import 'dart:async';
+import 'dart:io' show Platform;
 
 import 'package:flutter/widgets.dart';
 
 import 'src/android.dart';
+import 'src/linux.dart';
 import 'src/platform_interface.dart';
 import 'src/listen_callback.dart';
 import 'src/unsupported.dart';
 
 /// Export the callback for listening to data
 export 'src/listen_callback.dart';
+
+/// Export platform implementations for plugin registration
+export 'src/linux.dart' show FlutterGodotLinux;
+export 'src/android.dart' show FlutterGodotAndroid;
 
 /// Compatibility handling for unsupported platforms
 part 'flutter_godot_compat.dart';
@@ -35,6 +41,23 @@ final class FlutterGodot {
     required GodotListenCallback callback,
   }) {
     return FlutterGodotPlatform.instance.listenGodotData(callback: callback);
+  }
+
+  /// Forward input events to Godot
+  static Future<void> forwardInputEvent({
+    required double x,
+    required double y,
+    required String type,
+    required int button,
+    double pressure = 1.0,
+  }) {
+    return FlutterGodotPlatform.instance.forwardInputEvent(
+      x: x,
+      y: y,
+      type: type,
+      button: button,
+      pressure: pressure,
+    );
   }
 
   /// Game player widget

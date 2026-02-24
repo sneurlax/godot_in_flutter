@@ -7,19 +7,22 @@ import 'godot_player.dart';
 import 'platform_interface.dart';
 import 'listen_callback.dart';
 import 'linux_process.dart';
-import 'linux_ipc.dart';
+import 'file_protocol_ipc.dart';
 
 final class FlutterGodotLinux extends FlutterGodotPlatform {
   FlutterGodotLinux();
+
+  /// Register plugin with Flutter (called by Flutter's plugin system)
+  static void registerWith() {
+    FlutterGodotPlatform.instance = FlutterGodotLinux();
+  }
 
   final MethodChannel methodChannel = const MethodChannel(
     "flutter_godot_method",
   );
 
-  final EventChannel eventStream = const EventChannel("flutter_godot_event");
-
   GodotProcess? _godotProcess;
-  GodotIPC? _godotIPC;
+  FileProtocolIPC? _godotIPC;
   StreamSubscription<dynamic>? _ipcSubscription;
   bool _isInitializing = false;
   bool _isInitialized = false;
@@ -42,12 +45,13 @@ final class FlutterGodotLinux extends FlutterGodotPlatform {
     try {
       debugPrint('[FlutterGodot] Initializing Linux plugin...');
       _godotProcess = GodotProcess();
-      _godotIPC = GodotIPC();
 
       debugPrint('[FlutterGodot] Starting Godot subprocess...');
       await _godotProcess!.start(assetPath: 'assets/godot_game.pck');
 
-      debugPrint('[FlutterGodot] Connecting to Godot IPC socket...');
+      _godotIPC = FileProtocolIPC(_godotProcess!.pid!);
+
+      debugPrint('[FlutterGodot] Initializing file protocol IPC...');
       await _godotIPC!.initialize();
 
       _isInitialized = true;
@@ -140,25 +144,8 @@ final class FlutterGodotLinux extends FlutterGodotPlatform {
       debugPrint('[FlutterGodot] Stack trace: $stackTrace');
     });
 
-    // Also set up the native event channel as a fallback
-    return eventStream.receiveBroadcastStream().listen((dynamic event) {
-      if (event is Map && event["type"] != null) {
-        switch (event["type"]) {
-          case "takeString":
-            debugPrint('[FlutterGodot] Event channel received: ${event["data"]}');
-            callback(event["data"]);
-            break;
-          default:
-            debugPrint("[FlutterGodot] Unknown event type: ${event["type"]}");
-            break;
-        }
-      } else {
-        debugPrint("[FlutterGodot] Unknown event: $event");
-      }
-    }, onError: (error, stackTrace) {
-      debugPrint('[FlutterGodot] Event channel error: $error');
-      debugPrint('[FlutterGodot] Stack trace: $stackTrace');
-    });
+    // Return a no-op subscription (data flows through callback, not the stream)
+    return const Stream<dynamic>.empty().listen(null);
   }
 
   /// Game player widget
