@@ -5,7 +5,13 @@
 
 G_BEGIN_DECLS
 
+#ifndef FLUTTER_PLUGIN_EXPORT
+#ifdef FLUTTER_PLUGIN_IMPL
 #define FLUTTER_PLUGIN_EXPORT __attribute__((visibility("default")))
+#else
+#define FLUTTER_PLUGIN_EXPORT
+#endif
+#endif
 
 typedef struct _FlutterGodotPlugin FlutterGodotPlugin;
 typedef struct {
