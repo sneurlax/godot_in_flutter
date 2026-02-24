@@ -5,8 +5,8 @@ Demonstrates the flutter_godot plugin embedding a Godot game inside a Flutter ap
 ## Prerequisites
 
 - Flutter SDK >= 3.35
-- Linux x86_64
-- Godot 4.5.x binary (see setup below)
+- **Linux:** x86_64, Godot 4.5.x binary (see setup below)
+- **Android:** Android SDK, connected device or emulator
 
 ## Setup
 
@@ -41,8 +41,14 @@ cp game.pck ../assets/godot_game.pck
 
 ### 3. Run
 
+**Linux:**
 ```bash
 flutter run -d linux
+```
+
+**Android:**
+```bash
+flutter run -d android
 ```
 
 ## Project Structure
@@ -73,10 +79,16 @@ example/
 
 ## How It Works
 
-On Linux, the plugin:
+### Linux
 1. Starts a localhost HTTP server serving the Godot WASM files
 2. Starts a WebSocket server for bidirectional IPC
 3. Embeds a CEF WebView loading the Godot game from the HTTP server
 4. A JavaScript bridge in `index.html` relays messages between Godot and the WebSocket server
 
 Communication uses JSON messages over WebSocket with a dynamic (OS-assigned) port.
+
+### Android
+1. Extracts the `.pck` game pack from Flutter assets to the device cache
+2. Embeds Godot natively as a PlatformView with full Activity lifecycle management
+3. Uses MethodChannel (Flutter->Godot) and EventChannel (Godot->Flutter) for IPC
+4. A GodotPlugin bridges Flutter signals to GDScript

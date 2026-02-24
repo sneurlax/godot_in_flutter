@@ -27,7 +27,9 @@ The `flutter_godot` plugin allows you to embed Godot games as widgets into Flutt
 
 ## How It Works
 
-On Linux, Godot is exported as WebAssembly and runs inside a CEF (Chromium Embedded Framework) WebView embedded inline in the Flutter widget tree. A localhost HTTP server serves the WASM files, and a WebSocket server handles bidirectional communication.
+### Linux
+
+Godot is exported as WebAssembly and runs inside a CEF (Chromium Embedded Framework) WebView embedded inline in the Flutter widget tree. A localhost HTTP server serves the WASM files, and a WebSocket server handles bidirectional communication.
 
 ```
 Flutter App
@@ -42,11 +44,32 @@ Flutter App
 
 **Flutter -> Godot:** Flutter `sendDataToGodot()` -> WebSocket -> JS bridge -> `window._flutterMessages[]` -> GDScript `JavaScriptBridge.eval()` poll
 
-On Android, Godot runs natively via PlatformView with direct input handling.
+### Android
+
+Godot runs natively as an embedded `PlatformView` using the Godot Android library. The `.pck` game pack is extracted from Flutter assets to the device cache at runtime, then passed to Godot via `--main-pack`. Communication uses Flutter platform channels (MethodChannel + EventChannel) with a custom GodotPlugin that exposes `sendData()` to GDScript via signals.
+
+```
+Flutter App
+ +-- PlatformViewLink (AndroidViewSurface)
+      +-- Godot engine (native, full lifecycle management)
+      +-- GodotPlugin ("flutter_godot")
+           +-- MethodChannel: Flutter -> Godot (emitSignal)
+           +-- EventChannel: Godot -> Flutter (EventSink)
+```
+
+**Godot -> Flutter:** GDScript `FlutterGodot.sendData(string)` -> GodotPlugin -> EventChannel -> Flutter `dataStream`
+
+**Flutter -> Godot:** Flutter `sendDataToGodot()` -> MethodChannel -> GodotPlugin `emitSignal` -> GDScript signal handler
 
 ## Setup
 
-### Godot Binary
+### Prerequisites
+
+- Flutter SDK >= 3.35
+- **Linux:** x86_64, Godot 4.5.x binary (see below)
+- **Android:** Android SDK, Godot Android AAR library (bundled via `android/build.gradle`)
+
+### Godot Binary (Linux only)
 
 The Godot binary (`example/assets/bin/godot`) is **not in version control** (~130 MB). To set it up:
 
@@ -69,12 +92,14 @@ cd example/godot_project
 
 Note: The WebSocket bridge JavaScript in `index.html` must be re-injected after each export, as the export overwrites the file.
 
-**Android/native (.pck):**
+**Android (.pck):**
 ```bash
 cd example/godot_project
 ../assets/bin/godot --export-pack "Linux/X11" game.pck --headless
 cp game.pck ../assets/godot_game.pck
 ```
+
+The `.pck` file is included in Flutter assets and extracted to the device cache directory at runtime.
 
 ## Usage
 
@@ -124,11 +149,14 @@ cp game.pck ../assets/godot_game.pck
 | File | Purpose |
 |---|---|
 | `lib/src/linux.dart` | Linux platform: orchestrates HTTP server, WebSocket IPC, and CEF WebView |
-| `lib/src/godot_player.dart` | Widget that creates and displays the CEF WebView (Linux) or PlatformView (Android) |
-| `lib/src/websocket_ipc.dart` | WebSocket server for bidirectional JSON messaging |
-| `lib/src/godot_http_server.dart` | HTTP server that extracts and serves WASM files from Flutter assets |
-| `linux/flutter_godot.cc` | Minimal native plugin registration stub |
-| `example/assets/godot_web/index.html` | Godot WASM export with injected WebSocket bridge |
+| `lib/src/android.dart` | Android platform: MethodChannel/EventChannel IPC with native Godot |
+| `lib/src/godot_player.dart` | Widget that creates CEF WebView (Linux) or PlatformView (Android) |
+| `lib/src/websocket_ipc.dart` | WebSocket server for bidirectional JSON messaging (Linux) |
+| `lib/src/godot_http_server.dart` | HTTP server that serves WASM files from Flutter assets (Linux) |
+| `android/.../FlutterGodotPlugin.kt` | Android native plugin: Godot lifecycle, PlatformView, signal-based IPC |
+| `linux/flutter_godot.cc` | Minimal native plugin registration stub (Linux) |
+| `example/assets/godot_web/index.html` | Godot WASM export with injected WebSocket bridge (Linux) |
+| `example/assets/godot_game.pck` | Exported Godot game pack (Android) |
 | `example/godot_project/main.gd` | GDScript: console IPC for web mode, file IPC fallback for native |
 
 ### WebSocket IPC Protocol
@@ -166,6 +194,11 @@ print("__GODOT_IPC__:" + JSON.stringify(message))
 
 ## Known Issues
 
+**Linux:**
 - HotRestart causes display issues. Use HotReload or recompile.
 - The CEF dependency adds ~1.4GB (`libcef.so`) to the build output.
 - WebSocket server uses a dynamic port (OS-assigned) to avoid port conflicts between runs.
+
+**Android:**
+- Godot engine lifecycle is tied to the Activity; configuration changes trigger a process restart via `ProcessPhoenix`.
+- The `.pck` file is extracted from APK assets to cache on each PlatformView creation.
