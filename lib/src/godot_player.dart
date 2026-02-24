@@ -6,9 +6,15 @@ import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
+import 'package:webview_cef/webview_cef.dart';
 
 import '../flutter_godot.dart';
 import 'platform_interface.dart';
+
+// Direct import needed for the Linux-specific WebView + WebSocket API
+// which is not exposed through the platform interface.
+// ignore: unnecessary_import
+import 'linux.dart';
 
 final class GodotPlayer extends StatefulWidget {
   const GodotPlayer({super.key, this.name, this.package});
@@ -25,17 +31,84 @@ final class GodotPlayer extends StatefulWidget {
 class _GodotPlayerState extends State<GodotPlayer> {
   StreamSubscription<dynamic>? _godotDataSubscription;
   bool _isReady = false;
-  bool _linuxInitStarted = false;
-  Size? _lastSize;
-  Offset? _lastPosition;
+  bool _isWebViewInitialized = false;
+
+  /// webview_cef controller for Linux WebView rendering
+  WebViewController? _webviewController;
 
   @override
   void initState() {
     super.initState();
-    if (!Platform.isLinux) {
-      _setupGodotListener();
+    _setupGodotListener();
+
+    // On Linux, initialize the WebView
+    if (Platform.isLinux) {
+      _initializeWebView();
     }
-    // Linux: defer initialization until we know the widget size
+  }
+
+  /// Initialize the CEF WebView for Linux
+  Future<void> _initializeWebView() async {
+    final platform = FlutterGodotPlatform.instance;
+    if (platform is! FlutterGodotLinux) return;
+
+    try {
+      debugPrint('[GodotPlayer] Starting WebView initialization...');
+
+      // Wait for the platform to be ready (HTTP + WebSocket servers started)
+      await platform.ready;
+
+      // Create the WebView controller
+      _webviewController = WebviewManager().createWebView(
+        loading: const Text('Loading Godot...'),
+      );
+
+      // Set up event listener for console messages (monitoring/debug)
+      _webviewController!.setWebviewListener(WebviewEventsListener(
+        onTitleChanged: (title) {
+          debugPrint('[GodotPlayer] WebView title: $title');
+        },
+        onUrlChanged: (url) {
+          debugPrint('[GodotPlayer] WebView URL: $url');
+        },
+        onConsoleMessage:
+            (int level, String message, String source, int line) {
+          if (kDebugMode) {
+            debugPrint('[GodotPlayer] Console [$level]: $message');
+          }
+        },
+        onLoadStart: (controller, url) {
+          debugPrint('[GodotPlayer] WebView load start: $url');
+        },
+        onLoadEnd: (controller, url) {
+          debugPrint('[GodotPlayer] WebView load end: $url');
+          if (mounted) {
+            setState(() {
+              _isReady = true;
+            });
+          }
+        },
+      ));
+
+      // Initialize the WebView with the game URL (includes ?ws_port= parameter)
+      final gameUrl = platform.gameUrl;
+      debugPrint('[GodotPlayer] Loading game from: $gameUrl');
+      await _webviewController!.initialize(gameUrl);
+
+      // Register the controller with the platform (for JS injection fallback)
+      platform.setWebViewController(_webviewController!);
+
+      if (mounted) {
+        setState(() {
+          _isWebViewInitialized = true;
+        });
+      }
+
+      debugPrint('[GodotPlayer] WebView initialized successfully');
+    } catch (e, st) {
+      debugPrint('[GodotPlayer] WebView initialization error: $e');
+      debugPrint('[GodotPlayer] Stack trace: $st');
+    }
   }
 
   /// Set up listener for Godot data stream (triggers initialization)
@@ -53,55 +126,11 @@ class _GodotPlayerState extends State<GodotPlayer> {
     );
   }
 
-  /// Called after Linux layout is known to create embed window and start Godot
-  void _onLinuxLayout(BuildContext context, BoxConstraints constraints) {
-    if (!mounted) return;
-
-    final renderBox = context.findRenderObject() as RenderBox?;
-    if (renderBox == null || !renderBox.hasSize) return;
-
-    final size = renderBox.size;
-    final position = renderBox.localToGlobal(Offset.zero);
-
-    // First time: set pending size and trigger initialization
-    if (!_linuxInitStarted) {
-      _linuxInitStarted = true;
-      _lastSize = size;
-      _lastPosition = position;
-
-      final platform = FlutterGodotPlatform.instance;
-      if (platform is FlutterGodotLinux) {
-        platform.setEmbedSize(size, position);
-      }
-
-      _setupGodotListener();
-      return;
-    }
-
-    // Subsequent: update embed window if size/position changed
-    if (_lastSize != size || _lastPosition != position) {
-      _lastSize = size;
-      _lastPosition = position;
-
-      final platform = FlutterGodotPlatform.instance;
-      if (platform is FlutterGodotLinux) {
-        platform.updateEmbedWindow(
-          position.dx, position.dy, size.width, size.height,
-        );
-      }
-    }
-  }
-
   @override
   void dispose() {
     debugPrint('[GodotPlayer] Disposing...');
     _godotDataSubscription?.cancel();
-    if (Platform.isLinux) {
-      final platform = FlutterGodotPlatform.instance;
-      if (platform is FlutterGodotLinux) {
-        platform.destroyEmbedWindow();
-      }
-    }
+    _webviewController?.dispose();
     super.dispose();
   }
 
@@ -166,67 +195,102 @@ class _GodotPlayerState extends State<GodotPlayer> {
 
   @override
   Widget build(BuildContext context) {
+    // Android: use platform view directly
     if (Platform.isAndroid) {
       return _buildAndroidView();
     }
 
+    // Linux: use WebView to render Godot WASM
     if (Platform.isLinux) {
-      return _buildLinuxView();
+      return _buildLinuxWebView();
     }
 
+    // Unsupported platform
     return _buildUnsupportedWidget();
   }
 
-  /// Build Linux embedded view using X11 reparenting
-  Widget _buildLinuxView() {
+  /// Build the Linux WebView widget that displays Godot running as WASM
+  Widget _buildLinuxWebView() {
+    if (_webviewController == null || !_isWebViewInitialized) {
+      return _buildLoadingWidget();
+    }
+
+    return ValueListenableBuilder(
+      valueListenable: _webviewController!,
+      builder: (context, bool isReady, child) {
+        if (isReady) {
+          return _webviewController!.webviewWidget;
+        }
+        return _webviewController!.loadingWidget;
+      },
+    );
+  }
+
+  /// Build Android native view
+  Widget _buildAndroidView() {
     return Listener(
       onPointerDown: _handlePointerEvent,
       onPointerUp: _handlePointerEvent,
       onPointerMove: _handlePointerEvent,
-      child: LayoutBuilder(
-        builder: (context, constraints) {
-          WidgetsBinding.instance.addPostFrameCallback((_) {
-            _onLinuxLayout(context, constraints);
-          });
-          // Transparent container - Godot renders via X11 child window
-          return Container(color: Colors.black);
-        },
-      ),
-    );
-  }
-
-  /// Build Android native view (touch handled natively by Godot)
-  Widget _buildAndroidView() {
-    return PlatformViewLink(
+      child: PlatformViewLink(
         surfaceFactory:
             (BuildContext context, PlatformViewController controller) {
-              return AndroidViewSurface(
-                controller: controller as AndroidViewController,
-                hitTestBehavior: PlatformViewHitTestBehavior.opaque,
-                gestureRecognizers:
-                    const <Factory<OneSequenceGestureRecognizer>>{},
-              );
-            },
+          return AndroidViewSurface(
+            controller: controller as AndroidViewController,
+            hitTestBehavior: PlatformViewHitTestBehavior.opaque,
+            gestureRecognizers:
+                const <Factory<OneSequenceGestureRecognizer>>{},
+          );
+        },
         onCreatePlatformView: (PlatformViewCreationParams params) {
           return PlatformViewsService.initExpensiveAndroidView(
-              id: params.id,
-              viewType: GodotPlayer._viewType,
-              layoutDirection: TextDirection.ltr,
-              creationParamsCodec: const StandardMessageCodec(),
-              creationParams: widget.name != null
-                  ? widget.package == null
-                        ? {'asset_name': widget.name}
-                        : {
-                            'asset_name':
-                                'packages/${widget.package}/${widget.name}',
-                          }
-                  : null,
-              onFocus: () => params.onFocusChanged(true),
-            )
+            id: params.id,
+            viewType: GodotPlayer._viewType,
+            layoutDirection: TextDirection.ltr,
+            creationParamsCodec: const StandardMessageCodec(),
+            creationParams: widget.name != null
+                ? widget.package == null
+                    ? {'asset_name': widget.name}
+                    : {
+                        'asset_name':
+                            'packages/${widget.package}/${widget.name}',
+                      }
+                : null,
+            onFocus: () => params.onFocusChanged(true),
+          )
             ..addOnPlatformViewCreatedListener(params.onPlatformViewCreated)
             ..create();
         },
         viewType: GodotPlayer._viewType,
+      ),
+    );
+  }
+
+  /// Build loading widget during initialization
+  Widget _buildLoadingWidget() {
+    return Container(
+      color: Colors.grey[900],
+      child: Center(
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            const SizedBox(
+              width: 50,
+              height: 50,
+              child: CircularProgressIndicator(
+                strokeWidth: 3,
+              ),
+            ),
+            const SizedBox(height: 16),
+            Text(
+              'Loading Godot WebView...',
+              style: Theme.of(context).textTheme.bodyLarge?.copyWith(
+                    color: Colors.white,
+                  ),
+            ),
+          ],
+        ),
+      ),
     );
   }
 

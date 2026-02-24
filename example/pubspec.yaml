@@ -22,3 +22,4 @@ flutter:
   assets:
     - assets/godot_game.pck
     - assets/bin/  # Bundled Godot binary (optional, run setup_godot_bundle.sh to add)
+    - assets/godot_web/  # Godot WASM export for WebView approach
