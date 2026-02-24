@@ -1,0 +1,9 @@
+[configuration]
+
+entry_symbol = "godot_rs_init"
+compatibility_minimum = "4.5"
+
+[libraries]
+
+linux.release.x86_64 = "./bin/flutter_godot.so"
+linux.debug.x86_64 = "./bin/flutter_godot.so"

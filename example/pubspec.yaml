@@ -20,4 +20,5 @@ dev_dependencies:
 flutter:
   uses-material-design: true
   assets:
-    - assets/game.pck
+    - assets/godot_game.pck
+    - assets/bin/  # Bundled Godot binary (optional, run setup_godot_bundle.sh to add)
