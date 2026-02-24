@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io' show Platform;
 
 import 'package:flutter/material.dart';
 import 'package:flutter_godot/flutter_godot.dart';
@@ -72,7 +73,9 @@ class _HomePageState extends State<HomePage> {
         margin: const EdgeInsets.all(16),
         child: ClipRRect(
           borderRadius: const BorderRadius.all(Radius.circular(12.0)),
-          child: FlutterGodot.ofPlayer(name: 'assets/game.pck'),
+          child: Platform.isAndroid
+              ? FlutterGodot.ofPlayer()
+              : FlutterGodot.ofPlayer(name: 'assets/godot_game.pck'),
         ),
       ),
       floatingActionButtonLocation: FloatingActionButtonLocation.centerFloat,

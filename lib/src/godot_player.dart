@@ -171,10 +171,10 @@ class _GodotPlayerState extends State<GodotPlayer> {
               creationParamsCodec: const StandardMessageCodec(),
               creationParams: widget.name != null
                   ? widget.package == null
-                        ? {'asset_name': 'res://flutter_assets/${widget.name}'}
+                        ? {'asset_name': widget.name}
                         : {
                             'asset_name':
-                                'res://flutter_assets/packages/${widget.package}/${widget.name}',
+                                'packages/${widget.package}/${widget.name}',
                           }
                   : null,
               onFocus: () => params.onFocusChanged(true),

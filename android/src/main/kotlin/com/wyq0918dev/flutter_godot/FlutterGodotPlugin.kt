@@ -30,6 +30,7 @@ import org.godotengine.godot.plugin.GodotPlugin
 import org.godotengine.godot.plugin.SignalInfo
 import org.godotengine.godot.plugin.UsedByGodot
 import org.godotengine.godot.utils.ProcessPhoenix
+import java.io.File
 import java.util.concurrent.atomic.AtomicBoolean
 
 /** FlutterGodotPlugin */
@@ -53,6 +54,9 @@ class FlutterGodotPlugin : FlutterPlugin, ActivityAware, MethodChannel.MethodCal
 
     /** 初始化上下文 */
     private var initializationContext: Context? = null
+
+    /** Flutter asset lookup */
+    private var mFlutterAssets: FlutterPlugin.FlutterAssets? = null
 
     /** Godot容器 */
     private lateinit var mGodotContainer: FrameLayout
@@ -88,6 +92,8 @@ class FlutterGodotPlugin : FlutterPlugin, ActivityAware, MethodChannel.MethodCal
         mEventChannel.setStreamHandler(this@FlutterGodotPlugin)
         // 设置方法通道调用处理
         mMethodChannel.setMethodCallHandler(this@FlutterGodotPlugin)
+        // Save Flutter asset lookup reference
+        mFlutterAssets = binding.flutterAssets
     }
 
     /**
@@ -98,6 +104,7 @@ class FlutterGodotPlugin : FlutterPlugin, ActivityAware, MethodChannel.MethodCal
         mMethodChannel.setMethodCallHandler(null)
         // 清除事件通道流处理
         mEventChannel.setStreamHandler(null)
+        mFlutterAssets = null
     }
 
     /**
@@ -194,7 +201,9 @@ class FlutterGodotPlugin : FlutterPlugin, ActivityAware, MethodChannel.MethodCal
             override fun create(context: Context, viewId: Int, args: Any?): PlatformView {
                 return object : PlatformView {
                     init {
-                        mAssetName = (args as? Map<*, *>)?.get(key = ASSET_NAME_KEY) as? String
+                        val rawAssetName = (args as? Map<*, *>)?.get(key = ASSET_NAME_KEY) as? String
+                        // Extract Flutter asset to filesystem so Godot can access it
+                        mAssetName = rawAssetName?.let { extractFlutterAsset(context, it) }
                         mGodotContainer = FrameLayout(context).apply {
                             id = viewId
                         }
@@ -402,6 +411,34 @@ class FlutterGodotPlugin : FlutterPlugin, ActivityAware, MethodChannel.MethodCal
                     }
                 }
             }
+        }
+    }
+
+    /**
+     * Extract a Flutter asset from the APK to the app's cache directory
+     * so Godot can access it via a real filesystem path.
+     */
+    private fun extractFlutterAsset(context: Context, flutterAssetKey: String): String? {
+        val lookupKey = mFlutterAssets?.getAssetFilePathByName(flutterAssetKey)
+            ?: "flutter_assets/$flutterAssetKey"
+
+        val cacheDir = File(context.cacheDir, "flutter_godot")
+        cacheDir.mkdirs()
+
+        val fileName = flutterAssetKey.substringAfterLast("/")
+        val targetFile = File(cacheDir, fileName)
+
+        return try {
+            context.assets.open(lookupKey).use { input ->
+                targetFile.outputStream().use { output ->
+                    input.copyTo(output)
+                }
+            }
+            Log.d(TAG, "Extracted Flutter asset '$flutterAssetKey' to: ${targetFile.absolutePath}")
+            targetFile.absolutePath
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to extract Flutter asset '$flutterAssetKey' (lookup: $lookupKey)", e)
+            null
         }
     }
 
