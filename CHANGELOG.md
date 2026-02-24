@@ -1,3 +1,12 @@
+## 0.0.4+webview
+
+* Embed Godot on Linux via CEF WebView running Godot as WebAssembly.
+* Add WebSocket IPC for bidirectional Flutter-Godot communication.
+* Add GodotHttpServer for serving WASM files from Flutter assets.
+* Add webview_cef dependency for inline Chromium WebView rendering.
+* Add Godot web export preset and WASM build.
+* Replace native X11/XComposite texture capture approach.
+
 ## 0.0.3+linux
 
 * Add Linux platform support with file-based IPC.
