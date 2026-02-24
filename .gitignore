@@ -33,3 +33,8 @@ migrate_working_dir/
 build/
 
 .godot/
+
+# Godot binaries (too large for version control)
+example/assets/bin/godot
+example/assets/bin/Godot_*
+example/assets/bin/*.zip
