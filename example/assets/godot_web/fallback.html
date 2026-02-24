@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Flutter-Godot WebSocket IPC Fallback</title>
+    <style>
+        html, body {
+            margin: 0;
+            padding: 0;
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            background-color: #1a2030;
+            font-family: 'Segoe UI', 'Roboto', sans-serif;
+            color: white;
+        }
+        #canvas {
+            display: block;
+            width: 100%;
+            height: 100%;
+        }
+    </style>
+</head>
+<body>
+    <canvas id="canvas"></canvas>
+
+    <script>
+    (function() {
+        // Get WebSocket port from URL parameters (default: 5000)
+        var params = new URLSearchParams(window.location.search);
+        var wsPort = params.get('ws_port') || '5000';
+        var wsUrl = 'ws://127.0.0.1:' + wsPort;
+
+        // State
+        var messageCount = 0;
+        var lastMessage = '';
+        var wsConnected = false;
+        var ws = null;
+        var frameCount = 0;
+
+        // Canvas setup
+        var canvas = document.getElementById('canvas');
+        var ctx = canvas.getContext('2d');
+
+        function resizeCanvas() {
+            canvas.width = window.innerWidth;
+            canvas.height = window.innerHeight;
+        }
+        resizeCanvas();
+        window.addEventListener('resize', resizeCanvas);
+
+        // WebSocket connection
+        function connectWebSocket() {
+            try {
+                ws = new WebSocket(wsUrl);
+
+                ws.onopen = function() {
+                    console.log('[Fallback] WebSocket connected to ' + wsUrl);
+                    wsConnected = true;
+                    ws.send(JSON.stringify({
+                        type: 'data',
+                        payload: 'Godot fallback (JS) connected via WebSocket',
+                        timestamp: Date.now()
+                    }));
+                };
+
+                ws.onmessage = function(event) {
+                    try {
+                        var msg = JSON.parse(event.data);
+                        if (msg.type === 'data' && msg.payload) {
+                            messageCount++;
+                            lastMessage = msg.payload;
+                            console.log('[Fallback] Received: ' + msg.payload);
+                        }
+                    } catch (e) {
+                        messageCount++;
+                        lastMessage = event.data;
+                    }
+                };
+
+                ws.onclose = function() {
+                    console.log('[Fallback] WebSocket disconnected');
+                    wsConnected = false;
+                    setTimeout(connectWebSocket, 2000);
+                };
+
+                ws.onerror = function() {
+                    wsConnected = false;
+                };
+            } catch (e) {
+                console.log('[Fallback] WebSocket error: ' + e);
+                setTimeout(connectWebSocket, 2000);
+            }
+        }
+
+        connectWebSocket();
+
+        // Send periodic messages to Flutter
+        setInterval(function() {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                var msg = JSON.stringify({
+                    type: 'data',
+                    payload: 'Hello from Godot (fallback): ' + Date.now(),
+                    timestamp: Date.now()
+                });
+                ws.send(msg);
+            }
+        }, 2000);
+
+        // Render loop
+        function render() {
+            frameCount++;
+            var w = canvas.width;
+            var h = canvas.height;
+
+            // Background gradient
+            var grad = ctx.createLinearGradient(0, 0, 0, h);
+            grad.addColorStop(0, '#1a2030');
+            grad.addColorStop(1, '#0a1020');
+            ctx.fillStyle = grad;
+            ctx.fillRect(0, 0, w, h);
+
+            // Animated background circles
+            for (var i = 0; i < 5; i++) {
+                var t = (frameCount + i * 60) * 0.01;
+                var cx = w * 0.5 + Math.sin(t + i) * w * 0.3;
+                var cy = h * 0.5 + Math.cos(t * 0.7 + i) * h * 0.2;
+                var r = 50 + Math.sin(t * 0.5) * 30;
+                ctx.beginPath();
+                ctx.arc(cx, cy, r, 0, Math.PI * 2);
+                ctx.fillStyle = 'rgba(50, 80, 150, 0.15)';
+                ctx.fill();
+            }
+
+            // Title bar
+            ctx.fillStyle = '#0a1525';
+            ctx.fillRect(0, 0, w, h * 0.12);
+
+            ctx.font = 'bold ' + Math.max(16, h * 0.04) + 'px sans-serif';
+            ctx.fillStyle = '#c0d0ff';
+            ctx.textAlign = 'center';
+            ctx.fillText('Flutter-Godot Communication Test', w / 2, h * 0.08);
+
+            // Connection status indicator
+            var statusY = h * 0.2;
+            ctx.beginPath();
+            ctx.arc(w * 0.4, statusY, 8, 0, Math.PI * 2);
+            ctx.fillStyle = wsConnected ? '#00ff88' : '#ff4444';
+            ctx.fill();
+
+            ctx.font = Math.max(12, h * 0.025) + 'px sans-serif';
+            ctx.textAlign = 'left';
+            ctx.fillStyle = '#e0e0e0';
+            ctx.fillText(wsConnected ? 'WebSocket Connected' : 'WebSocket Disconnected', w * 0.4 + 20, statusY + 5);
+
+            // Message count
+            ctx.font = 'bold ' + Math.max(14, h * 0.035) + 'px sans-serif';
+            ctx.textAlign = 'center';
+            ctx.fillStyle = '#ffffff';
+            ctx.fillText('Messages from Flutter: ' + messageCount, w / 2, h * 0.35);
+
+            // IPC mode
+            ctx.font = Math.max(12, h * 0.025) + 'px sans-serif';
+            ctx.fillStyle = '#8899bb';
+            ctx.fillText('WebSocket IPC (Fallback JS)', w / 2, h * 0.42);
+            ctx.fillText('Messages sent every 2 seconds', w / 2, h * 0.47);
+
+            // Last message
+            if (lastMessage) {
+                ctx.font = Math.max(11, h * 0.02) + 'px monospace';
+                ctx.fillStyle = '#66aaff';
+                var displayMsg = lastMessage.length > 60 ? lastMessage.substring(0, 60) + '...' : lastMessage;
+                ctx.fillText('Last: ' + displayMsg, w / 2, h * 0.55);
+            }
+
+            // Status bar
+            ctx.fillStyle = '#050a15';
+            ctx.fillRect(0, h * 0.9, w, h * 0.1);
+
+            ctx.font = Math.max(10, h * 0.02) + 'px sans-serif';
+            ctx.fillStyle = '#6088aa';
+            ctx.textAlign = 'center';
+            ctx.fillText('Godot Engine Fallback (JavaScript) - WebSocket IPC PoC', w / 2, h * 0.96);
+
+            requestAnimationFrame(render);
+        }
+
+        render();
+    })();
+    </script>
+</body>
+</html>
