@@ -6,12 +6,11 @@ import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
-import 'package:webview_cef/webview_cef.dart';
 
 import '../flutter_godot.dart';
 import 'platform_interface.dart';
 
-// Direct import needed for the Linux-specific WebView + WebSocket API
+// Direct import needed for the Linux-specific native WebView + WebSocket API
 // which is not exposed through the platform interface.
 // ignore: unnecessary_import
 import 'linux.dart';
@@ -33,21 +32,21 @@ class _GodotPlayerState extends State<GodotPlayer> {
   bool _isReady = false;
   bool _isWebViewInitialized = false;
 
-  /// webview_cef controller for Linux WebView rendering
-  WebViewController? _webviewController;
+  /// Texture ID from native webkit2gtk webview (-1 = not ready)
+  int _textureId = -1;
 
   @override
   void initState() {
     super.initState();
     _setupGodotListener();
 
-    // On Linux, initialize the WebView
+    // On Linux, initialize the native WebView
     if (Platform.isLinux) {
       _initializeWebView();
     }
   }
 
-  /// Initialize the CEF WebView for Linux
+  /// Initialize the native webkit2gtk WebView for Linux
   Future<void> _initializeWebView() async {
     final platform = FlutterGodotPlatform.instance;
     if (platform is! FlutterGodotLinux) return;
@@ -55,52 +54,18 @@ class _GodotPlayerState extends State<GodotPlayer> {
     try {
       debugPrint('[GodotPlayer] Starting WebView initialization...');
 
-      // Wait for the platform to be ready (HTTP + WebSocket servers started)
+      // Wait for the platform to be ready (HTTP + WebSocket servers + native webview)
       await platform.ready;
 
-      // Create the WebView controller
-      _webviewController = WebviewManager().createWebView(
-        loading: const Text('Loading Godot...'),
-      );
+      // Get the texture ID from the platform
+      final textureId = platform.textureId;
+      debugPrint('[GodotPlayer] Native WebView texture ID: $textureId');
 
-      // Set up event listener for console messages (monitoring/debug)
-      _webviewController!.setWebviewListener(WebviewEventsListener(
-        onTitleChanged: (title) {
-          debugPrint('[GodotPlayer] WebView title: $title');
-        },
-        onUrlChanged: (url) {
-          debugPrint('[GodotPlayer] WebView URL: $url');
-        },
-        onConsoleMessage:
-            (int level, String message, String source, int line) {
-          if (kDebugMode) {
-            debugPrint('[GodotPlayer] Console [$level]: $message');
-          }
-        },
-        onLoadStart: (controller, url) {
-          debugPrint('[GodotPlayer] WebView load start: $url');
-        },
-        onLoadEnd: (controller, url) {
-          debugPrint('[GodotPlayer] WebView load end: $url');
-          if (mounted) {
-            setState(() {
-              _isReady = true;
-            });
-          }
-        },
-      ));
-
-      // Initialize the WebView with the game URL (includes ?ws_port= parameter)
-      final gameUrl = platform.gameUrl;
-      debugPrint('[GodotPlayer] Loading game from: $gameUrl');
-      await _webviewController!.initialize(gameUrl);
-
-      // Register the controller with the platform (for JS injection fallback)
-      platform.setWebViewController(_webviewController!);
-
-      if (mounted) {
+      if (mounted && textureId >= 0) {
         setState(() {
+          _textureId = textureId;
           _isWebViewInitialized = true;
+          _isReady = true;
         });
       }
 
@@ -130,7 +95,6 @@ class _GodotPlayerState extends State<GodotPlayer> {
   void dispose() {
     debugPrint('[GodotPlayer] Disposing...');
     _godotDataSubscription?.cancel();
-    _webviewController?.dispose();
     super.dispose();
   }
 
@@ -200,7 +164,7 @@ class _GodotPlayerState extends State<GodotPlayer> {
       return _buildAndroidView();
     }
 
-    // Linux: use WebView to render Godot WASM
+    // Linux: use native webkit2gtk Texture widget to render Godot WASM
     if (Platform.isLinux) {
       return _buildLinuxWebView();
     }
@@ -209,20 +173,20 @@ class _GodotPlayerState extends State<GodotPlayer> {
     return _buildUnsupportedWidget();
   }
 
-  /// Build the Linux WebView widget that displays Godot running as WASM
+  /// Build the Linux WebView widget using Flutter's Texture widget
+  /// backed by native webkit2gtk via FlPixelBufferTexture
   Widget _buildLinuxWebView() {
-    if (_webviewController == null || !_isWebViewInitialized) {
+    if (!_isWebViewInitialized || _textureId < 0) {
       return _buildLoadingWidget();
     }
 
-    return ValueListenableBuilder(
-      valueListenable: _webviewController!,
-      builder: (context, bool isReady, child) {
-        if (isReady) {
-          return _webviewController!.webviewWidget;
-        }
-        return _webviewController!.loadingWidget;
-      },
+    return Listener(
+      onPointerDown: _handlePointerEvent,
+      onPointerUp: _handlePointerEvent,
+      onPointerMove: _handlePointerEvent,
+      child: Texture(
+        textureId: _textureId,
+      ),
     );
   }
 

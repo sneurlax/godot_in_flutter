@@ -1,7 +1,7 @@
 import 'dart:async';
 
+import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart';
-import 'package:webview_cef/webview_cef.dart';
 
 import 'godot_player.dart';
 import 'platform_interface.dart';
@@ -9,12 +9,13 @@ import 'listen_callback.dart';
 import 'websocket_ipc.dart';
 import 'godot_http_server.dart';
 
-/// Linux platform implementation using WebView + WebSocket IPC.
+/// Linux platform implementation using native webkit2gtk WebView + WebSocket IPC.
 ///
 /// Architecture:
 /// 1. Flutter starts an HTTP server to serve Godot WASM export files
 /// 2. Flutter starts a WebSocket server for bidirectional IPC
-/// 3. A webview_cef WebView loads the Godot game from the HTTP server
+/// 3. A native webkit2gtk WebView (via FlPixelBufferTexture) loads the Godot
+///    game from the HTTP server -- this replaces the 1.4GB webview_cef/CEF dependency
 /// 4. JavaScript WebSocket bridge (injected in index.html) connects to
 ///    Flutter's WebSocket server
 /// 5. Godot -> Flutter: Godot print() -> JS console.log interception ->
@@ -29,20 +30,17 @@ final class FlutterGodotLinux extends FlutterGodotPlatform {
     FlutterGodotPlatform.instance = FlutterGodotLinux();
   }
 
+  /// Method channel for communicating with native webkit2gtk plugin
+  static const MethodChannel _channel = MethodChannel('flutter_godot_method');
+
   /// The HTTP server serving Godot WASM files
   final GodotHttpServer _httpServer = GodotHttpServer();
 
   /// WebSocket IPC server for robust bidirectional communication
   WebSocketIPC? _wsIPC;
 
-  /// WebSocket server port (0 = OS-assigned)
-
-  /// The webview_cef controller (set during widget initialization)
-  WebViewController? _webviewController;
-
-  /// Completer that resolves when the WebView controller is ready
-  final Completer<WebViewController> _controllerCompleter =
-      Completer<WebViewController>();
+  /// Texture ID returned by the native plugin (-1 = not created)
+  int _textureId = -1;
 
   /// Completer that resolves when _initialize() finishes
   Completer<void>? _initCompleter;
@@ -57,11 +55,10 @@ final class FlutterGodotLinux extends FlutterGodotPlatform {
   /// Asset directory for Godot web export files
   static const String _webAssetDir = 'assets/godot_web';
 
-  /// Initialize the WebView-based Linux integration
+  /// Initialize the webkit2gtk-based Linux integration
   Future<void> _initialize() async {
     if (_isInitialized) return;
     if (_isInitializing) {
-      // Wait for the in-progress initialization to finish
       await _initCompleter?.future;
       return;
     }
@@ -70,7 +67,7 @@ final class FlutterGodotLinux extends FlutterGodotPlatform {
     _initCompleter = Completer<void>();
     try {
       debugPrint(
-          '[FlutterGodotLinux] Initializing WebView + WebSocket IPC...');
+          '[FlutterGodotLinux] Initializing native webkit2gtk WebView + WebSocket IPC...');
 
       // Start the HTTP server to serve WASM files
       debugPrint('[FlutterGodotLinux] Starting HTTP server...');
@@ -85,9 +82,20 @@ final class FlutterGodotLinux extends FlutterGodotPlatform {
       debugPrint(
           '[FlutterGodotLinux] WebSocket IPC server running on port ${_wsIPC!.port}');
 
-      // Initialize WebviewManager (must be done before creating controllers)
-      debugPrint('[FlutterGodotLinux] Initializing WebviewManager...');
-      await WebviewManager().initialize();
+      // Create the native webkit2gtk WebView via method channel
+      debugPrint('[FlutterGodotLinux] Creating native WebView...');
+      final textureId = await _channel.invokeMethod<int>('createWebView', {
+        'width': 1280,
+        'height': 720,
+      });
+      _textureId = textureId ?? -1;
+      debugPrint(
+          '[FlutterGodotLinux] Native WebView created, texture_id=$_textureId');
+
+      // Load the game URL
+      final url = gameUrl;
+      debugPrint('[FlutterGodotLinux] Loading game URL: $url');
+      await _channel.invokeMethod('loadUrl', {'url': url});
 
       _isInitialized = true;
       _initCompleter?.complete();
@@ -101,13 +109,8 @@ final class FlutterGodotLinux extends FlutterGodotPlatform {
     }
   }
 
-  /// Set the WebView controller (called from the widget when it's created)
-  void setWebViewController(WebViewController controller) {
-    _webviewController = controller;
-    if (!_controllerCompleter.isCompleted) {
-      _controllerCompleter.complete(controller);
-    }
-  }
+  /// Get the texture ID for the Texture widget
+  int get textureId => _textureId;
 
   /// Get the game URL for the WebView, including WebSocket port parameter
   String get gameUrl =>
@@ -125,6 +128,15 @@ final class FlutterGodotLinux extends FlutterGodotPlatform {
   /// Get or wait for initialization to complete
   Future<void> get ready => _initialize();
 
+  /// Evaluate JavaScript in the WebView
+  Future<void> evaluateJavaScript(String script) async {
+    try {
+      await _channel.invokeMethod('evaluateJavaScript', {'script': script});
+    } catch (e) {
+      debugPrint('[FlutterGodotLinux] JS evaluation error: $e');
+    }
+  }
+
   /// Send data to Godot via WebSocket IPC
   @override
   Future<bool> sendDataToGodot({required String data}) async {
@@ -139,8 +151,8 @@ final class FlutterGodotLinux extends FlutterGodotPlatform {
         return result;
       }
 
-      // Fallback: direct JavaScript injection via WebView controller
-      if (_webviewController != null) {
+      // Fallback: direct JavaScript injection via native WebView
+      if (_textureId >= 0) {
         final escaped = data.replaceAll('\\', '\\\\').replaceAll("'", "\\'");
         final js = '''
           (function() {
@@ -149,7 +161,7 @@ final class FlutterGodotLinux extends FlutterGodotPlatform {
             return true;
           })();
         ''';
-        await _webviewController!.evaluateJavascript(js);
+        await evaluateJavaScript(js);
         debugPrint(
             '[FlutterGodotLinux] Data sent to Godot via JS injection (fallback)');
         return true;
@@ -183,7 +195,7 @@ final class FlutterGodotLinux extends FlutterGodotPlatform {
       }
 
       // Fallback: direct JavaScript injection
-      if (_webviewController != null) {
+      if (_textureId >= 0) {
         final js = '''
           (function() {
             if (!window._flutterMessages) window._flutterMessages = [];
@@ -194,7 +206,7 @@ final class FlutterGodotLinux extends FlutterGodotPlatform {
             return true;
           })();
         ''';
-        await _webviewController!.evaluateJavascript(js);
+        await evaluateJavaScript(js);
       }
     } catch (error, stackTrace) {
       debugPrint('[FlutterGodotLinux] ERROR in forwardInputEvent: $error');
@@ -248,9 +260,14 @@ final class FlutterGodotLinux extends FlutterGodotPlatform {
       await _wsIPC?.stop();
       _wsIPC = null;
 
-      if (_webviewController != null) {
-        await _webviewController!.dispose();
-        _webviewController = null;
+      // Dispose native webview
+      if (_textureId >= 0) {
+        try {
+          await _channel.invokeMethod('disposeWebView');
+        } catch (e) {
+          debugPrint('[FlutterGodotLinux] Error disposing native webview: $e');
+        }
+        _textureId = -1;
       }
 
       await _httpServer.stop();

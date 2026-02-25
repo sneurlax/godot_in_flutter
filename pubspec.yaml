@@ -15,7 +15,8 @@ dependencies:
   plugin_platform_interface: ^2.0.2
   flutter_plugin_android_lifecycle: ^2.0.29
   crypto: ^3.0.2
-  webview_cef: ^0.2.2
+  # webview_cef removed: replaced with native webkit2gtk via FlPixelBufferTexture
+  # This eliminates the 1.4GB CEF/Chromium download dependency
 
 dev_dependencies:
   flutter_test:
