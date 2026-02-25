@@ -1,0 +1,90 @@
+diff --git a/platform/linuxbsd/SCsub b/platform/linuxbsd/SCsub
+index abc1234..def5678 100644
+--- a/platform/linuxbsd/SCsub
++++ b/platform/linuxbsd/SCsub
+@@ -26,6 +26,10 @@ if env["x11"]:
+ if env["wayland"]:
+     common_linuxbsd += SConscript("wayland/SCsub")
+
++# Embedded rendering surfaces (for library builds)
++if env["library_type"] in ["static_library", "shared_library"]:
++    common_linuxbsd += SConscript("embedded/SCsub")
++
+ if env["speechd"]:
+     common_linuxbsd.append("tts_linux.cpp")
+     if env["use_sowrap"]:
+diff --git a/platform/linuxbsd/api/api.cpp b/platform/linuxbsd/api/api.cpp
+index abc1234..def5678 100644
+--- a/platform/linuxbsd/api/api.cpp
++++ b/platform/linuxbsd/api/api.cpp
+@@ -10,6 +10,14 @@
+ #include "platform/linuxbsd/x11/rendering_native_surface_x11.h"
+ #endif
+
++#if defined(GLES3_ENABLED)
++#include "platform/linuxbsd/embedded/rendering_native_surface_linux_egl.h"
++#endif
++
++#if defined(VULKAN_ENABLED)
++#include "platform/linuxbsd/embedded/rendering_native_surface_linux_vulkan.h"
++#endif
++
+ #endif
+
+ void register_core_linuxbsd_api() {
+@@ -20,6 +28,14 @@ void register_core_linuxbsd_api() {
+ #ifdef X11_ENABLED
+ 	GDREGISTER_ABSTRACT_CLASS(RenderingNativeSurfaceX11);
+ #endif
++
++#if defined(GLES3_ENABLED)
++	GDREGISTER_ABSTRACT_CLASS(RenderingNativeSurfaceLinuxEGL);
++#endif
++
++#if defined(VULKAN_ENABLED)
++	GDREGISTER_ABSTRACT_CLASS(RenderingNativeSurfaceLinuxVulkan);
++#endif
+ #endif
+ }
+
+diff --git a/servers/display_server_embedded.cpp b/servers/display_server_embedded.cpp
+index abc1234..def5678 100644
+--- a/servers/display_server_embedded.cpp
++++ b/servers/display_server_embedded.cpp
+@@ -46,7 +46,11 @@
+ #endif // RD_ENABLED
+
+-#include "drivers/apple/rendering_native_surface_apple.h"
++#ifdef __APPLE__
++#  include "drivers/apple/rendering_native_surface_apple.h"
++#elif defined(LINUXBSD_ENABLED)
++// Linux uses RenderingNativeSurfaceLinuxVulkan or RenderingNativeSurfaceLinuxEGL
++#endif
+
+ Ref<RenderingNativeSurface> DisplayServerEmbedded::native_surface = nullptr;
+
+@@ -108,7 +112,11 @@ DisplayServerEmbedded::DisplayServerEmbedded(const String &p_rendering_driver, D
+
+ #if defined(GLES3_ENABLED)
+ 	if (rendering_driver == "opengl3") {
+-		ERR_FAIL_MSG("Embedded OpenGL rendering is not yet supported.");
++#if defined(LINUXBSD_ENABLED)
++		// On Linux, OpenGL embedded rendering is handled via RenderingNativeSurfaceLinuxEGL.
++		// The EGL surface manages its own context and FBO.
++		print_verbose("DisplayServerEmbedded: OpenGL rendering on Linux uses EGL offscreen surface.");
++#else
++		ERR_FAIL_MSG("Embedded OpenGL rendering is not yet supported on this platform.");
++#endif
+ 	}
+ #endif
+
+@@ -146,6 +154,9 @@ Vector<String> DisplayServerEmbedded::get_rendering_drivers_func() {
+ #if defined(VULKAN_ENABLED)
+ 	drivers.push_back("vulkan");
+ #endif
++#if defined(GLES3_ENABLED) && defined(LINUXBSD_ENABLED)
++	drivers.push_back("opengl3");
++#endif
+ 	//#if defined(GLES3_ENABLED)
+ 	//	drivers.push_back("opengl3");
+ 	//#endif
