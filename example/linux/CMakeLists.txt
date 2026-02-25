@@ -1,5 +1,11 @@
 # Project-level configuration.
 cmake_minimum_required(VERSION 3.13)
+
+# WPE WebKit libraries (required by flutter_inappwebview_linux).
+# If WPE WebKit is installed to a non-standard prefix, set PKG_CONFIG_PATH:
+#   set(ENV{PKG_CONFIG_PATH} "/path/to/wpe/lib/pkgconfig:$ENV{PKG_CONFIG_PATH}")
+# See flutter_inappwebview_linux's WPE_BACKEND.md for installation instructions.
+
 project(runner LANGUAGES CXX)
 
 # The name of the executable created for the application. Change this to change
