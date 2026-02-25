@@ -8,6 +8,8 @@ import 'package:flutter/widgets.dart';
 
 import 'src/android.dart';
 import 'src/linux.dart';
+import 'src/linux_native.dart';
+import 'src/linux_native_config.dart';
 import 'src/platform_interface.dart';
 import 'src/listen_callback.dart';
 import 'src/unsupported.dart';
@@ -17,6 +19,8 @@ export 'src/listen_callback.dart';
 
 /// Export platform implementations for plugin registration
 export 'src/linux.dart' show FlutterGodotLinux;
+export 'src/linux_native.dart' show FlutterGodotLinuxNative;
+export 'src/linux_native_config.dart' show LinuxNativeConfig;
 export 'src/android.dart' show FlutterGodotAndroid;
 
 /// Compatibility handling for unsupported platforms

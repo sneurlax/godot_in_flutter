@@ -11,10 +11,12 @@ import 'package:webview_cef/webview_cef.dart';
 import '../flutter_godot.dart';
 import 'platform_interface.dart';
 
-// Direct import needed for the Linux-specific WebView + WebSocket API
-// which is not exposed through the platform interface.
+// Direct imports needed for Linux-specific APIs not exposed through
+// the platform interface.
 // ignore: unnecessary_import
 import 'linux.dart';
+// ignore: unnecessary_import
+import 'linux_native.dart';
 
 final class GodotPlayer extends StatefulWidget {
   const GodotPlayer({super.key, this.name, this.package});
@@ -36,14 +38,31 @@ class _GodotPlayerState extends State<GodotPlayer> {
   /// webview_cef controller for Linux WebView rendering
   WebViewController? _webviewController;
 
+  /// Whether using native LibGodot mode on Linux
+  bool _isNativeMode = false;
+
+  /// Whether native mode initialization is complete
+  bool _isNativeInitialized = false;
+
+  /// Texture ID for native mode rendering
+  int? _nativeTextureId;
+
+  /// Track last reported size to avoid redundant resize calls
+  Size? _lastReportedSize;
+
   @override
   void initState() {
     super.initState();
     _setupGodotListener();
 
-    // On Linux, initialize the WebView
     if (Platform.isLinux) {
-      _initializeWebView();
+      final platform = FlutterGodotPlatform.instance;
+      if (platform is FlutterGodotLinuxNative) {
+        _isNativeMode = true;
+        _initializeNative(platform);
+      } else {
+        _initializeWebView();
+      }
     }
   }
 
@@ -107,6 +126,28 @@ class _GodotPlayerState extends State<GodotPlayer> {
       debugPrint('[GodotPlayer] WebView initialized successfully');
     } catch (e, st) {
       debugPrint('[GodotPlayer] WebView initialization error: $e');
+      debugPrint('[GodotPlayer] Stack trace: $st');
+    }
+  }
+
+  /// Initialize native LibGodot embedding on Linux
+  Future<void> _initializeNative(FlutterGodotLinuxNative platform) async {
+    try {
+      debugPrint('[GodotPlayer] Starting native Godot initialization...');
+      await platform.ready;
+
+      if (mounted) {
+        setState(() {
+          _nativeTextureId = platform.textureId;
+          _isNativeInitialized = platform.isInitialized;
+          _isReady = _isNativeInitialized;
+        });
+      }
+
+      debugPrint(
+          '[GodotPlayer] Native Godot initialized, textureId: $_nativeTextureId');
+    } catch (e, st) {
+      debugPrint('[GodotPlayer] Native initialization error: $e');
       debugPrint('[GodotPlayer] Stack trace: $st');
     }
   }
@@ -200,8 +241,11 @@ class _GodotPlayerState extends State<GodotPlayer> {
       return _buildAndroidView();
     }
 
-    // Linux: use WebView to render Godot WASM
+    // Linux: native LibGodot texture or WebView fallback
     if (Platform.isLinux) {
+      if (_isNativeMode) {
+        return _buildLinuxNativeView();
+      }
       return _buildLinuxWebView();
     }
 
@@ -222,6 +266,43 @@ class _GodotPlayerState extends State<GodotPlayer> {
           return _webviewController!.webviewWidget;
         }
         return _webviewController!.loadingWidget;
+      },
+    );
+  }
+
+  /// Build the Linux native Texture widget displaying Godot's rendered output.
+  ///
+  /// Uses LayoutBuilder to detect size changes and notify the native plugin
+  /// so Godot can resize its viewport accordingly.
+  Widget _buildLinuxNativeView() {
+    if (!_isNativeInitialized || _nativeTextureId == null) {
+      return _buildLoadingWidget();
+    }
+
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final size = Size(constraints.maxWidth, constraints.maxHeight);
+
+        // Notify native plugin of size changes
+        if (_lastReportedSize != size &&
+            size.width > 0 &&
+            size.height > 0) {
+          _lastReportedSize = size;
+          final platform = FlutterGodotPlatform.instance;
+          if (platform is FlutterGodotLinuxNative) {
+            platform.resize(
+              width: size.width.toInt(),
+              height: size.height.toInt(),
+            );
+          }
+        }
+
+        return Listener(
+          onPointerDown: _handlePointerEvent,
+          onPointerUp: _handlePointerEvent,
+          onPointerMove: _handlePointerEvent,
+          child: Texture(textureId: _nativeTextureId!),
+        );
       },
     );
   }
@@ -268,6 +349,7 @@ class _GodotPlayerState extends State<GodotPlayer> {
 
   /// Build loading widget during initialization
   Widget _buildLoadingWidget() {
+    final label = _isNativeMode ? 'Loading Godot...' : 'Loading Godot WebView...';
     return Container(
       color: Colors.grey[900],
       child: Center(
@@ -283,7 +365,7 @@ class _GodotPlayerState extends State<GodotPlayer> {
             ),
             const SizedBox(height: 16),
             Text(
-              'Loading Godot WebView...',
+              label,
               style: Theme.of(context).textTheme.bodyLarge?.copyWith(
                     color: Colors.white,
                   ),

@@ -1,0 +1,1170 @@
+==============================================================================
+  EGLImage / DMA-BUF Zero-Copy Texture Sharing Roadmap
+  Godot-Flutter Integration on Linux
+==============================================================================
+
+  Date:    2026-02-25
+  Status:  Future-proofing design document
+  Scope:   Linux desktop (X11 and Wayland)
+  Context: Fludot project -- embedding Godot rendering inside Flutter
+
+==============================================================================
+  TABLE OF CONTENTS
+==============================================================================
+
+  1. Executive Summary
+  2. What is DMA-BUF?
+  3. EGL Extensions for DMA-BUF Import/Export
+  4. Vulkan Extensions for DMA-BUF
+  5. How This Applies to Godot-Flutter
+  6. What Flutter Changes Are Needed
+  7. What Godot Changes Are Needed
+  8. Prerequisites and Driver Support
+  9. Step-by-Step Implementation Plan
+  10. Comparison Table: Approaches
+  11. Open Questions and Risks
+  12. References
+
+==============================================================================
+  1. EXECUTIVE SUMMARY
+==============================================================================
+
+The current fludot architecture uses a WebView-based approach (CEF) to embed
+Godot's web export inside Flutter, communicating via WebSocket IPC. This works
+but has inherent limitations: WASM performance overhead, no native GPU
+rendering, and an extra browser process.
+
+The ideal future path is zero-copy GPU buffer sharing: Godot renders each
+frame into GPU memory, and Flutter composites that frame directly without any
+CPU-side pixel copying. On Linux, the kernel mechanism for this is DMA-BUF.
+
+This document lays out the full technical path for DMA-BUF-based texture
+sharing between Godot (rendering via Vulkan or OpenGL) and Flutter (compositing
+via Skia/OpenGL today, Impeller/Vulkan in the future).
+
+Why this matters:
+  - Zero-copy: no GPU->CPU->GPU round-trip
+  - 60 FPS at 1080p without saturating memory bandwidth
+  - Future-proof: works with both OpenGL and Vulkan on both sides
+  - Standard Linux mechanism: used by Wayland compositors, GStreamer, OBS, etc.
+
+
+==============================================================================
+  2. WHAT IS DMA-BUF?
+==============================================================================
+
+2.1 Overview
+------------
+
+DMA-BUF (Direct Memory Access Buffer) is a Linux kernel subsystem introduced
+in kernel 3.3 that provides a framework for sharing buffers across multiple
+device drivers and subsystems. It exposes GPU (or other DMA-capable device)
+memory to userspace as a file descriptor, enabling zero-copy sharing between:
+
+  - Different GPU contexts within the same process
+  - Different processes (via Unix domain socket fd passing)
+  - Different hardware devices (GPU, video decoder, display controller)
+
+The key insight: a DMA-BUF file descriptor is just a regular Linux fd. It can
+be passed between processes using SCM_RIGHTS over Unix domain sockets, just
+like any other fd. The receiving process can then import it into its own
+GPU context.
+
+2.2 Core Components
+--------------------
+
+  (a) dma-buf object:
+      - Represents an sg_table (scatter-gather list) of physical memory pages
+      - Exposed to userspace as a file descriptor
+      - Reference counted; stays alive as long as any fd or attachment exists
+
+  (b) Exporter:
+      - The driver/subsystem that originally allocates the buffer
+      - Calls dma_buf_export() to wrap the buffer, then dma_buf_fd() to get
+        the userspace file descriptor
+      - Example: GPU driver allocating a render target
+
+  (c) Importer:
+      - Any driver/subsystem that wants to access the same buffer
+      - Calls dma_buf_get(fd) to obtain the dma-buf, then dma_buf_attach()
+        to connect it to its device
+      - Example: another GPU context importing the render target as a texture
+
+  (d) Fence (implicit sync):
+      - Attached to the dma-buf to signal when a device finishes accessing it
+      - Enables the importing side to wait until rendering is complete
+      - Managed via DMA_BUF_IOCTL_SYNC for CPU access
+
+2.3 The Zero-Copy Mechanism
+-----------------------------
+
+Traditional texture sharing (what we do NOT want):
+
+    Godot GPU -> vkCopyImageToBuffer -> CPU RAM -> glTexSubImage2D -> Flutter GPU
+
+    Cost: 2 PCIe/memory bus transfers + CPU involvement
+    At 1080p BGRA @ 60fps: ~500 MB/s of wasted bandwidth
+
+DMA-BUF zero-copy sharing:
+
+    Godot GPU -> renders to VkImage/GL texture backed by DMA-BUF
+                                |
+                     (same physical GPU memory)
+                                |
+    Flutter GPU <- imports DMA-BUF fd as EGLImage/VkImage
+
+    Cost: 0 copies. Both sides reference the same physical memory.
+    At 1080p BGRA @ 60fps: 0 bytes of bandwidth wasted on copies.
+
+2.4 Synchronization
+--------------------
+
+When two GPU contexts share a buffer, they need synchronization:
+
+  - Implicit sync: The kernel's dma-fence mechanism automatically prevents
+    the importer from reading before the exporter finishes writing. This is
+    the default for most DMA-BUF usage.
+
+  - Explicit sync: Using VK_KHR_external_semaphore_fd, one Vulkan context
+    can export a semaphore as an fd, and the other can import and wait on it.
+    This provides finer-grained control.
+
+  - EGL sync: eglCreateSyncKHR with EGL_SYNC_NATIVE_FENCE_ANDROID can create
+    sync objects from DMA-BUF fences.
+
+For our use case (Godot renders, Flutter reads), implicit sync should suffice
+for the initial implementation. Explicit sync can be added later for tighter
+frame timing.
+
+
+==============================================================================
+  3. EGL EXTENSIONS FOR DMA-BUF IMPORT/EXPORT
+==============================================================================
+
+3.1 EGL_EXT_image_dma_buf_import (Importing)
+----------------------------------------------
+
+Purpose: Create an EGLImage from a DMA-BUF file descriptor.
+
+This is the primary extension Flutter needs to import Godot's rendered frames.
+
+Usage:
+
+    EGLint attribs[] = {
+        EGL_WIDTH,                     frame_width,
+        EGL_HEIGHT,                    frame_height,
+        EGL_LINUX_DRM_FOURCC_EXT,      DRM_FORMAT_ARGB8888,
+        EGL_DMA_BUF_PLANE0_FD_EXT,    dmabuf_fd,
+        EGL_DMA_BUF_PLANE0_OFFSET_EXT, 0,
+        EGL_DMA_BUF_PLANE0_PITCH_EXT,  stride,
+        EGL_NONE
+    };
+
+    EGLImage image = eglCreateImageKHR(
+        display,
+        EGL_NO_CONTEXT,        // Must be EGL_NO_CONTEXT
+        EGL_LINUX_DMA_BUF_EXT, // Target
+        NULL,                  // Buffer must be NULL
+        attribs
+    );
+
+    // Bind to GL texture:
+    glGenTextures(1, &texture);
+    glBindTexture(GL_TEXTURE_2D, texture);
+    glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, image);
+
+Required attributes:
+  - EGL_WIDTH, EGL_HEIGHT: logical pixel dimensions
+  - EGL_LINUX_DRM_FOURCC_EXT: DRM fourcc pixel format (from drm_fourcc.h)
+  - EGL_DMA_BUF_PLANE0_FD_EXT: the DMA-BUF file descriptor
+  - EGL_DMA_BUF_PLANE0_OFFSET_EXT: byte offset to first sample in plane 0
+  - EGL_DMA_BUF_PLANE0_PITCH_EXT: row pitch in bytes
+
+Support: Mesa (all drivers), NVIDIA proprietary (since ~535.x).
+
+3.2 EGL_EXT_image_dma_buf_import_modifiers
+--------------------------------------------
+
+Extension to the above that adds DRM format modifier support. Modifiers
+describe the tiling/compression format of the buffer (vendor-specific).
+
+Key addition: EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT and
+              EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT
+
+Also adds eglQueryDmaBufFormatsEXT() and eglQueryDmaBufModifiersEXT() to
+enumerate supported format+modifier combinations.
+
+For Godot-Flutter sharing with linear tiling (DRM_FORMAT_MOD_LINEAR), the
+base extension suffices. Modifiers become important when using vendor-specific
+tiled formats for better GPU performance.
+
+3.3 EGL_MESA_image_dma_buf_export (Exporting)
+------------------------------------------------
+
+Purpose: Export an EGLImage as a DMA-BUF file descriptor.
+
+This is what Godot needs if rendering with OpenGL and wants to export frames.
+
+Two functions:
+
+    // Query format/planes/modifier:
+    EGLBoolean eglExportDMABUFImageQueryMESA(
+        EGLDisplay display,
+        EGLImage image,
+        int *fourcc,        // DRM fourcc format
+        int *num_planes,
+        EGLuint64KHR *modifiers
+    );
+
+    // Get fd, stride, offset per plane:
+    EGLBoolean eglExportDMABUFImageMESA(
+        EGLDisplay display,
+        EGLImage image,
+        int *fds,
+        EGLint *strides,
+        EGLint *offsets
+    );
+
+Typical workflow (Godot OpenGL side):
+
+    1. Create GL texture, render to it via FBO
+    2. Create EGLImage from GL texture:
+       eglCreateImageKHR(display, context, EGL_GL_TEXTURE_2D, texture, NULL)
+    3. Export DMA-BUF:
+       eglExportDMABUFImageQueryMESA(display, image, &fourcc, &planes, &mod)
+       eglExportDMABUFImageMESA(display, image, &fd, &stride, &offset)
+    4. Send fd + metadata to Flutter via Unix socket or shared memory
+
+Note: This is a MESA extension, not EXT. Supported by all Mesa drivers.
+NVIDIA proprietary added support in recent driver versions.
+
+3.4 The GL Import Pipeline (Flutter Side)
+-------------------------------------------
+
+Once Flutter has the DMA-BUF fd:
+
+    1. eglCreateImageKHR(..., EGL_LINUX_DMA_BUF_EXT, ...) -> EGLImage
+    2. glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, image)  -> GL texture
+    3. Use texture in Flutter's compositor (via FlTextureGL or Texture widget)
+
+The GL texture created this way is a "live" reference to the same GPU memory.
+No copy occurs. When Godot renders a new frame to the underlying buffer,
+the Flutter-side texture automatically reflects the new content (after
+proper synchronization).
+
+
+==============================================================================
+  4. VULKAN EXTENSIONS FOR DMA-BUF
+==============================================================================
+
+4.1 VK_EXT_external_memory_dma_buf
+-------------------------------------
+
+Purpose: Import/export DMA-BUF file descriptors as VkDeviceMemory.
+
+This is the Vulkan-native way to share GPU buffers via DMA-BUF.
+Together with VK_KHR_external_memory_fd, it provides the complete path.
+
+Handle type: VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT
+
+Dependencies:
+  - VK_KHR_external_memory (core in Vulkan 1.1)
+  - VK_KHR_external_memory_fd
+
+4.2 Exporting VkImage as DMA-BUF (Godot Side)
+-------------------------------------------------
+
+Step 1: Create VkImage with external memory support
+
+    VkExternalMemoryImageCreateInfo external_info = {
+        .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
+        .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+    };
+
+    VkImageCreateInfo image_info = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+        .pNext = &external_info,
+        .format = VK_FORMAT_B8G8R8A8_UNORM,
+        .extent = { width, height, 1 },
+        .tiling = VK_IMAGE_TILING_LINEAR,  // Required for DMA-BUF compat
+        .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                 VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+        // ...
+    };
+
+    vkCreateImage(device, &image_info, NULL, &image);
+
+Step 2: Allocate exportable memory
+
+    VkExportMemoryAllocateInfo export_info = {
+        .sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO,
+        .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+    };
+
+    VkMemoryAllocateInfo alloc_info = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .pNext = &export_info,
+        .allocationSize = mem_reqs.size,
+        .memoryTypeIndex = suitable_memory_type,
+    };
+
+    vkAllocateMemory(device, &alloc_info, NULL, &memory);
+    vkBindImageMemory(device, image, memory, 0);
+
+Step 3: Export as DMA-BUF fd
+
+    VkMemoryGetFdInfoKHR fd_info = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR,
+        .memory = memory,
+        .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+    };
+
+    int dmabuf_fd;
+    vkGetMemoryFdKHR(device, &fd_info, &dmabuf_fd);
+
+Important: Each call to vkGetMemoryFdKHR creates a NEW fd. The caller
+must close() it when done, or transfer ownership.
+
+4.3 Importing DMA-BUF as VkImage (Flutter/Impeller Side)
+-----------------------------------------------------------
+
+Step 1: Create VkImage with matching parameters
+
+    VkExternalMemoryImageCreateInfo external_info = {
+        .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
+        .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+    };
+
+    // image_info must match the exporter's format, tiling, etc.
+    vkCreateImage(device, &image_info, NULL, &image);
+
+Step 2: Import the DMA-BUF fd as VkDeviceMemory
+
+    VkImportMemoryFdInfoKHR import_info = {
+        .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR,
+        .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+        .fd = dmabuf_fd,  // Ownership transfers to Vulkan
+    };
+
+    VkMemoryAllocateInfo alloc_info = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .pNext = &import_info,
+        .allocationSize = mem_reqs.size,
+        .memoryTypeIndex = suitable_memory_type,
+    };
+
+    vkAllocateMemory(device, &alloc_info, NULL, &memory);
+    vkBindImageMemory(device, image, memory, 0);
+
+4.4 VK_EXT_image_drm_format_modifier
+---------------------------------------
+
+This extension bridges Vulkan's VkFormat system with DRM's fourcc format +
+modifier system. When importing/exporting DMA-BUFs, the DRM format modifier
+describes the memory layout (tiling, compression).
+
+Key modifiers:
+  - DRM_FORMAT_MOD_LINEAR (0): Simple row-major layout. Universal compat.
+  - DRM_FORMAT_MOD_INVALID: Modifier is unknown; implicit modifier assumed.
+  - Vendor-specific: I915_FORMAT_MOD_X_TILED, AMDGPU_FORMAT_MOD_*, etc.
+
+For maximum compatibility, use DRM_FORMAT_MOD_LINEAR. This may sacrifice
+some GPU performance (tiled formats can be faster for rendering), but
+guarantees the importing side can understand the layout.
+
+For advanced usage, both sides can negotiate a mutually-supported modifier
+by querying supported modifiers via:
+  - eglQueryDmaBufModifiersEXT() (EGL)
+  - vkGetPhysicalDeviceFormatProperties2() with
+    VkDrmFormatModifierPropertiesListEXT (Vulkan)
+
+4.5 Vulkan -> DMA-BUF -> GL Cross-API Path
+---------------------------------------------
+
+This is the most likely initial path for Godot-Flutter:
+Godot renders with Vulkan, Flutter composites with OpenGL/Skia.
+
+    Godot (Vulkan)                          Flutter (OpenGL/Skia)
+    +------------------+                    +-------------------+
+    | VkImage          |                    | GL texture        |
+    | VkDeviceMemory   |                    | (from EGLImage)   |
+    |   |              |                    |   ^               |
+    |   v              |                    |   |               |
+    | vkGetMemoryFdKHR |                    | eglCreateImageKHR |
+    |   |              |                    |   ^               |
+    |   v              |                    |   |               |
+    | DMA-BUF fd  ------>--Unix socket-->-----> fd              |
+    +------------------+                    +-------------------+
+
+    Same physical GPU memory. Zero copies.
+
+This cross-API path works because DMA-BUF is an API-agnostic kernel
+mechanism. The buffer layout is described by DRM fourcc + modifier,
+not by any particular graphics API.
+
+
+==============================================================================
+  5. HOW THIS APPLIES TO GODOT-FLUTTER
+==============================================================================
+
+5.1 Architecture Overview
+---------------------------
+
+    +--------------------------------------------------------------------+
+    |  Flutter Process                                                    |
+    |                                                                     |
+    |  +-------------------------+    +-------------------------------+   |
+    |  | Flutter UI (Dart)       |    | Native Plugin (C++)           |   |
+    |  |                         |    |                               |   |
+    |  |  Texture(textureId)  <-------> FlTextureGL / FlDmaBufTexture |   |
+    |  |  widget                 |    |    ^                          |   |
+    |  +-------------------------+    |    | imports DMA-BUF fd       |   |
+    |                                 |    |                          |   |
+    |                                 |  +--------------------+       |   |
+    |                                 |  | libgodot.so        |       |   |
+    |                                 |  |                    |       |   |
+    |                                 |  | Vulkan render      |       |   |
+    |                                 |  |    |               |       |   |
+    |                                 |  |    v               |       |   |
+    |                                 |  | DMA-BUF export     |       |   |
+    |                                 |  |  (fd + metadata)   |       |   |
+    |                                 |  +--------------------+       |   |
+    |                                 +-------------------------------+   |
+    +--------------------------------------------------------------------+
+
+All within the same process. No Unix socket needed for fd passing when
+Godot runs as libgodot.so inside Flutter's process -- the fd is just an
+integer that can be passed directly between the native plugin and the
+FlTexture implementation.
+
+5.2 Path A: Godot Vulkan -> DMA-BUF -> Flutter OpenGL (Current)
+------------------------------------------------------------------
+
+This is the path for today's Flutter on Linux (Skia + OpenGL/EGL).
+
+Godot side (Vulkan, inside libgodot.so):
+  1. Create VkImage with VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT
+  2. Render scene to the VkImage
+  3. Export DMA-BUF fd via vkGetMemoryFdKHR
+  4. Signal frame ready (invoke callback with fd + width/height/stride/format)
+
+Flutter side (OpenGL, native plugin):
+  1. Receive DMA-BUF fd from Godot's callback
+  2. eglCreateImageKHR(EGL_LINUX_DMA_BUF_EXT, fd, format, ...)
+  3. glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, egl_image)
+  4. Register GL texture with Flutter via FlTextureGL
+  5. Flutter's Skia compositor samples the texture into its render pass
+
+Synchronization:
+  - Implicit DMA-BUF fences handle GPU-GPU sync
+  - Double-buffering: Godot renders to back image while Flutter reads front
+
+5.3 Path B: Godot Vulkan -> DMA-BUF -> Flutter Vulkan (Future/Impeller)
+--------------------------------------------------------------------------
+
+When Flutter moves to Impeller + Vulkan on Linux:
+
+Godot side (Vulkan, inside libgodot.so):
+  1. Same as Path A: export DMA-BUF fd from VkDeviceMemory
+
+Flutter/Impeller side (Vulkan):
+  1. Receive DMA-BUF fd
+  2. vkAllocateMemory with VkImportMemoryFdInfoKHR (DMA_BUF handle type)
+  3. vkCreateImage + vkBindImageMemory with imported memory
+  4. Use VK_KHR_external_semaphore_fd for frame sync
+  5. Impeller compositor samples the VkImage in its render pass
+
+This is even more efficient than Path A because there is no EGL/GL
+interop layer. Pure Vulkan on both sides.
+
+5.4 Path C: Godot OpenGL -> DMA-BUF -> Flutter OpenGL (Alternative)
+----------------------------------------------------------------------
+
+If Godot is configured to use OpenGL instead of Vulkan:
+
+Godot side (OpenGL, inside libgodot.so):
+  1. Render to FBO backed by GL texture
+  2. Create EGLImage from GL texture via eglCreateImageKHR(EGL_GL_TEXTURE_2D)
+  3. Export DMA-BUF fd via eglExportDMABUFImageMESA
+  4. Signal frame ready with fd + metadata
+
+Flutter side (OpenGL, native plugin):
+  1. eglCreateImageKHR(EGL_LINUX_DMA_BUF_EXT, fd, ...)
+  2. glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, egl_image)
+  3. Register with FlTextureGL
+
+Note: If Godot and Flutter share the same EGL context (or a shared context),
+DMA-BUF is not needed -- they can share GL texture IDs directly. DMA-BUF
+is primarily needed for cross-context or cross-process sharing.
+
+5.5 Double Buffering Strategy
+-------------------------------
+
+To avoid tearing and allow concurrent rendering:
+
+    Frame N:
+      Godot renders to Image[0]          Flutter composites Image[1]
+
+    Frame N+1:
+      Godot renders to Image[1]          Flutter composites Image[0]
+
+Each image has its own DMA-BUF fd (exported once at creation time).
+The fd does not change between frames -- only the content of the buffer does.
+Synchronization ensures Flutter does not read a buffer Godot is writing to.
+
+The RenderingNativeSurfaceLinuxVulkan class already implements this
+double-buffering scheme with SWAPCHAIN_IMAGE_COUNT = 2.
+
+
+==============================================================================
+  6. WHAT FLUTTER CHANGES ARE NEEDED
+==============================================================================
+
+6.1 Current State of Flutter Linux Embedder
+----------------------------------------------
+
+As of Flutter 3.38+ (early 2026):
+
+  - Rendering backend: Skia with OpenGL ES via EGL
+  - Impeller: Available but NOT the default on Linux desktop
+  - External textures: Supported via FlTextureGL (OpenGL textures)
+  - DMA-BUF import: NOT supported natively in the embedder
+  - Vulkan external textures: NOT supported (Flutter issue #117937)
+
+The Linux embedder creates its own EGLDisplay and EGLContext for rendering.
+Plugins can register external textures using:
+
+  - FlTextureGL: subclass that provides a GL texture name + dimensions
+  - FlPixelBufferTexture: provides raw pixel data (CPU copy, slow)
+
+6.2 What Works Today (No Flutter Changes)
+--------------------------------------------
+
+Option 1: FlTextureGL with shared EGL context
+  - Get Flutter's EGLDisplay from GdkGLContext of the FlView's GdkWindow
+  - Create Godot's EGL context shared with Flutter's context
+  - Godot renders to a GL texture visible in both contexts
+  - Register the texture via FlTextureGL
+  - NO DMA-BUF needed; same GPU context family
+  - Limitation: Godot must use OpenGL, not Vulkan
+
+Option 2: FlPixelBufferTexture with CPU readback
+  - Godot renders (Vulkan or OpenGL), reads pixels back to CPU
+  - FlPixelBufferTexture copies pixels into a GL texture
+  - Works with any Godot renderer
+  - Limitation: GPU->CPU->GPU copy every frame. Slow.
+
+Option 3: FlTextureGL with EGL import of DMA-BUF (NEW, needs plugin work)
+  - Godot renders with Vulkan, exports DMA-BUF fd
+  - Native plugin imports DMA-BUF fd as EGLImage -> GL texture
+  - Register the GL texture via FlTextureGL
+  - NO Flutter engine changes needed
+  - All DMA-BUF handling happens in the native plugin
+  - This is the recommended first implementation target
+
+6.3 What Needs Flutter Engine Changes
+----------------------------------------
+
+For optimal Impeller/Vulkan integration in the future:
+
+  (a) Flutter issue #117937: External Texture Support for Vulkan
+      Status: Open, P3 priority
+      Need: FlutterVulkanImage or equivalent for plugins to provide
+            VkImage handles that Impeller can sample from
+      Impact: Would allow direct Vulkan-to-Vulkan texture sharing
+
+  (b) Flutter issue #144613: Embedder API Vulkan External Resources
+      Status: Open
+      Need: Embedder API extensions for importing VkImage + VkSemaphore
+            from external sources
+      Impact: Would enable DMA-BUF import at the Impeller level
+
+  (c) Flutter issue #137639: Impeller Surface Textures in Vulkan
+      Status: Open
+      Need: Impeller-level support for external surface textures
+            (equivalent to what exists for Metal and OpenGL)
+      Impact: Required for Impeller to render external VkImages
+
+  (d) Hypothetical: FlDmaBufTexture
+      A new texture type in the Linux embedder that accepts a DMA-BUF fd
+      directly and handles EGLImage creation internally.
+      This would simplify plugin development significantly.
+      Not yet proposed as a Flutter issue.
+
+6.4 Recommended Strategy
+---------------------------
+
+Phase 1 (works today, no Flutter changes):
+  -> Use FlTextureGL + EGL DMA-BUF import in the native plugin
+  -> Godot renders with Vulkan, exports DMA-BUF
+  -> Plugin imports as EGLImage -> GL texture -> FlTextureGL
+
+Phase 2 (when Impeller lands on Linux):
+  -> Use VK_EXT_external_memory_dma_buf in Impeller
+  -> Import DMA-BUF directly as VkImage
+  -> May need Flutter engine patches or upstream contribution
+
+Phase 3 (ideal, requires Flutter upstream):
+  -> Native FlDmaBufTexture or FlVulkanTexture in the embedder
+  -> Plugin just passes fd + metadata, embedder handles everything
+
+
+==============================================================================
+  7. WHAT GODOT CHANGES ARE NEEDED
+==============================================================================
+
+7.1 Existing Work: RenderingNativeSurfaceLinuxVulkan
+------------------------------------------------------
+
+The fludot project already has a complete implementation of
+RenderingNativeSurfaceLinuxVulkan (written by agent-ab93e469), located at:
+
+    godot_patches/platform/linuxbsd/embedded/
+        rendering_native_surface_linux_vulkan.h
+        rendering_native_surface_linux_vulkan.cpp
+        rendering_native_surface_linux_egl.h
+        rendering_native_surface_linux_egl.cpp
+
+This code implements three modes:
+
+  MODE_DMABUF_EXPORT (zero-copy):
+    - Creates VkImage with VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT
+    - Allocates memory with VkExportMemoryAllocateInfo
+    - Uses VK_IMAGE_TILING_LINEAR for cross-API compatibility
+    - Exports DMA-BUF fd via vkGetMemoryFdKHR
+    - Invokes GodotVulkanDmaBufReadyCallback with fd + metadata
+
+  MODE_CPU_READBACK (fallback):
+    - Renders to VkImage in device-local memory
+    - Copies to host-visible staging buffer via vkCmdCopyImageToBuffer
+    - Maps staging buffer and passes pixel pointer to callback
+
+  MODE_EXTERNAL_SWAPCHAIN (Vulkan-to-Vulkan):
+    - For future Impeller integration
+    - Exports VkSemaphore via VK_KHR_external_semaphore_fd
+    - Both sides share VkDeviceMemory and synchronize with external semaphores
+
+Key implementation details already handled:
+  - Double-buffered swapchain (SWAPCHAIN_IMAGE_COUNT = 2)
+  - Headless Vulkan context (no VkSurfaceKHR needed)
+  - Memory type selection for exportable memory
+  - Image layout transitions for readback
+  - Resize support with resource recreation
+  - Proper cleanup/destruction
+
+7.2 What Still Needs Work in Godot
+-------------------------------------
+
+  (a) Integration with RenderingDevice:
+      The headless Vulkan context driver (RenderingContextDriverVulkanLinuxHeadless)
+      creates a "virtual" surface with a null VkSurfaceKHR. Godot's
+      RenderingDevice needs to be adapted to render to our offscreen
+      VkImages instead of the normal swapchain images. This requires
+      changes to rendering_device_vulkan.cpp in the Godot source.
+
+      Estimated effort: 3-5 days for someone familiar with Godot internals.
+
+  (b) DRM Format Modifier support:
+      The current implementation hardcodes DRM_FORMAT_MOD_LINEAR (via
+      VK_IMAGE_TILING_LINEAR). For better performance, we should query
+      mutually-supported modifiers using
+      VkDrmFormatModifierPropertiesListEXT and negotiate with the
+      importing side.
+
+      Estimated effort: 1-2 days.
+
+  (c) OpenGL/EGL path completion:
+      The RenderingNativeSurfaceLinuxEGL class header exists but the
+      implementation (.cpp) for the DMA-BUF export path is incomplete.
+      The EGL path requires:
+        - GBM-based EGL context creation (for headless operation)
+        - EGL_MESA_image_dma_buf_export integration
+        - FBO double-buffering
+
+      Estimated effort: 2-3 days.
+
+  (d) LibGodot build integration:
+      The patch files need to be applied to Migeran's LibGodot fork and
+      the SCsub build files need to be verified for the embedded/ directory.
+      The existing GODOT_LINUX_PATCH.md documents this process.
+
+      Estimated effort: 1 day.
+
+  (e) Thread safety:
+      Godot rendering runs on a dedicated thread. The frame callback
+      (dmabuf_callback or readback_callback) needs proper synchronization
+      with Flutter's UI thread. The current implementation invokes the
+      callback synchronously within present_frame(), which may need to
+      be changed to a producer-consumer queue.
+
+      Estimated effort: 1-2 days.
+
+7.3 Godot DMA-BUF Export Callback Interface
+----------------------------------------------
+
+The existing callback signature:
+
+    typedef void (*GodotVulkanDmaBufReadyCallback)(
+        int    p_dmabuf_fd,     // DMA-BUF file descriptor
+        uint32_t p_width,       // Frame width in pixels
+        uint32_t p_height,      // Frame height in pixels
+        uint32_t p_stride,      // Row pitch in bytes
+        uint32_t p_drm_format,  // DRM fourcc (e.g., DRM_FORMAT_BGRA8888)
+        uint64_t p_modifier,    // DRM format modifier
+        void   *p_user_data     // User-provided context
+    );
+
+This callback provides all the information Flutter needs to import the
+DMA-BUF as an EGLImage or VkImage.
+
+
+==============================================================================
+  8. PREREQUISITES AND DRIVER SUPPORT
+==============================================================================
+
+8.1 Linux Kernel Requirements
+-------------------------------
+
+  Minimum: Linux 3.3 (DMA-BUF introduction)
+  Recommended: Linux 5.12+ (improved DMA-BUF API, better driver support)
+  For NVIDIA open driver: Linux 5.15+ (open-gpu-kernel-modules requirement)
+
+  The DMA-BUF subsystem has been stable since 3.3, but newer kernels add:
+    - Improved fence support (4.x)
+    - dma_buf heap allocator (5.6+)
+    - Better VFIO integration (6.19+)
+
+  Practical minimum for desktop use: Linux 5.4+ (Ubuntu 20.04 kernel)
+
+8.2 Mesa Driver Support (AMD, Intel, Open-Source)
+----------------------------------------------------
+
+  All Mesa drivers with Vulkan support provide:
+    - VK_KHR_external_memory_fd: YES (since Mesa 17.x)
+    - VK_EXT_external_memory_dma_buf: YES (since Mesa 18.x)
+    - VK_EXT_image_drm_format_modifier: YES (since Mesa 19.x)
+    - VK_KHR_external_semaphore_fd: YES
+
+  EGL extensions:
+    - EGL_EXT_image_dma_buf_import: YES (all Mesa EGL drivers)
+    - EGL_EXT_image_dma_buf_import_modifiers: YES (Mesa 18.x+)
+    - EGL_MESA_image_dma_buf_export: YES (Mesa 10.x+, all Mesa drivers)
+
+  In practice, any system running Mesa 20.x+ (Ubuntu 20.04+) has full
+  DMA-BUF support for both Vulkan and EGL paths.
+
+  Tested drivers:
+    - Intel (ANV Vulkan, i965/iris GL): Full support
+    - AMD (RADV Vulkan, radeonsi GL): Full support
+    - llvmpipe (software Vulkan): Partial (no DMA-BUF export)
+
+8.3 NVIDIA Proprietary Driver
+--------------------------------
+
+  CRITICAL LIMITATIONS:
+
+  (a) DMA-BUF import (receiving buffers from others):
+      - EGL_EXT_image_dma_buf_import: Supported since driver 535.x
+      - VK_EXT_external_memory_dma_buf: NOT supported on proprietary driver
+      - Can import DMA-BUFs from NVIDIA's own allocations
+      - Cross-vendor import (e.g., from Intel iGPU): LIMITED / NO
+
+  (b) DMA-BUF export (sharing buffers with others):
+      - EGL_MESA_image_dma_buf_export: Supported in recent drivers (535+)
+      - Vulkan DMA-BUF export: NOT supported on proprietary driver
+      - The proprietary driver uses VK_KHR_external_memory_fd with
+        VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT instead
+
+  (c) Cross-driver limitations:
+      - NVIDIA cannot import DMA-BUFs from non-NVIDIA sources (hardware
+        limitation: cannot map foreign GPU memory)
+      - Other drivers cannot import NVIDIA's opaque fds
+
+  PRACTICAL IMPACT FOR FLUDOT:
+
+  Since both Godot and Flutter run on the SAME GPU within the SAME process,
+  the cross-vendor limitation does NOT apply. Both sides use the same
+  NVIDIA driver, so DMA-BUF sharing within the same device works.
+
+  However, we should:
+  - Use VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT as a fallback
+    when VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT is not available
+  - For Vulkan-to-GL path on NVIDIA: use opaque fd export from Vulkan,
+    then import via the GL_EXT_memory_object_fd extension instead of
+    EGL DMA-BUF import
+
+  RECOMMENDATION:
+  For the initial implementation, target Mesa (AMD/Intel) as the primary
+  platform. Add NVIDIA-specific fallback paths later. The CPU readback
+  fallback (MODE_CPU_READBACK) handles NVIDIA gracefully in the meantime.
+
+8.4 NVIDIA NVK (Open-Source Vulkan)
+--------------------------------------
+
+  NVK is the open-source Vulkan driver for NVIDIA GPUs in Mesa.
+  As of early 2026, NVK supports:
+    - VK_EXT_external_memory_dma_buf: YES
+    - VK_EXT_image_drm_format_modifier: YES (implemented by Collabora)
+    - Full DMA-BUF export/import like other Mesa drivers
+
+  NVK is the recommended driver for NVIDIA users who need DMA-BUF support.
+  It requires Turing (GTX 16xx / RTX 20xx) or newer GPUs.
+
+8.5 Extension Availability Check (Runtime)
+--------------------------------------------
+
+The implementation should check for extensions at runtime:
+
+  Vulkan side (Godot):
+    vkEnumerateDeviceExtensionProperties() for:
+      - VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME
+      - VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME
+      - VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME
+      - VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME
+
+  EGL side (Flutter plugin):
+    eglQueryString(display, EGL_EXTENSIONS) for:
+      - "EGL_EXT_image_dma_buf_import"
+      - "EGL_EXT_image_dma_buf_import_modifiers"
+
+  If any required extension is missing, fall back to CPU readback.
+
+8.6 Build Dependencies
+------------------------
+
+  Ubuntu/Debian packages needed:
+
+    # Core graphics
+    sudo apt install -y \
+        libvulkan-dev vulkan-validationlayers-dev \
+        libegl-dev libgles-dev libgl-dev \
+        libgbm-dev libdrm-dev \
+        mesa-vulkan-drivers
+
+    # Headers for DRM formats
+    sudo apt install -y libdrm-dev
+    # Provides: /usr/include/libdrm/drm_fourcc.h
+
+    # Vulkan SDK (optional, for validation)
+    # https://vulkan.lunarg.com/sdk/home#linux
+
+
+==============================================================================
+  9. STEP-BY-STEP IMPLEMENTATION PLAN
+==============================================================================
+
+Estimated total effort: 4-6 weeks for a single developer.
+
+Phase 1: Foundation (Week 1-2)
+-------------------------------
+
+  Step 1.1: Build libgodot.so with DMA-BUF patches [2 days]
+    - Apply the existing godot_patches to Migeran's LibGodot fork
+    - Build with: scons platform=linuxbsd library_type=shared_library
+                        vulkan=yes opengl3=no
+    - Verify the build produces libgodot.so
+    - Test basic loading with dlopen
+
+  Step 1.2: Verify MODE_CPU_READBACK works end-to-end [3 days]
+    - Create a minimal C++ Flutter native plugin
+    - Load libgodot.so, create RenderingNativeSurfaceLinuxVulkan (readback)
+    - Hook up readback callback to FlPixelBufferTexture
+    - Display Godot's rendered frame in Flutter's Texture widget
+    - This validates the entire pipeline without DMA-BUF complexity
+
+  Step 1.3: Add extension detection [1 day]
+    - Query VK_EXT_external_memory_dma_buf availability
+    - Query EGL_EXT_image_dma_buf_import availability
+    - Log available extensions and modes
+    - Choose best mode automatically with fallback chain:
+        MODE_DMABUF_EXPORT -> MODE_CPU_READBACK
+
+Phase 2: DMA-BUF Export from Godot (Week 2-3)
+------------------------------------------------
+
+  Step 2.1: Test MODE_DMABUF_EXPORT on Mesa [2 days]
+    - Enable MODE_DMABUF_EXPORT in RenderingNativeSurfaceLinuxVulkan
+    - Verify DMA-BUF fd is valid (> 0)
+    - Write a simple test that exports, then imports in the same process
+    - Test on Intel (ANV) and AMD (RADV)
+
+  Step 2.2: Handle tiling and format negotiation [2 days]
+    - Query VkDrmFormatModifierPropertiesListEXT for supported modifiers
+    - Use VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT when supported
+    - Fall back to VK_IMAGE_TILING_LINEAR otherwise
+    - Export correct DRM fourcc format (DRM_FORMAT_ARGB8888 or XRGB8888)
+
+  Step 2.3: Proper synchronization [1 day]
+    - Verify implicit DMA-BUF sync works with double buffering
+    - Add explicit fence support as optional enhancement
+    - Test with validation layers enabled
+
+Phase 3: DMA-BUF Import in Flutter Plugin (Week 3-4)
+------------------------------------------------------
+
+  Step 3.1: Implement FlDmaBufTextureGL helper [3 days]
+    - Create a FlTextureGL subclass that:
+        (a) Receives DMA-BUF fd + metadata from Godot's callback
+        (b) Creates EGLImage via eglCreateImageKHR(EGL_LINUX_DMA_BUF_EXT)
+        (c) Binds to GL texture via glEGLImageTargetTexture2DOES
+        (d) Returns the GL texture name in the FlTextureGL callback
+    - Handle EGLImage lifecycle (create once per buffer, reuse across frames)
+    - Double-buffer: maintain two EGLImages, swap on frame boundary
+
+  Step 3.2: Wire up to Flutter's texture registry [1 day]
+    - Register the FlDmaBufTextureGL with FlTextureRegistrar
+    - Get textureId, pass to Dart side
+    - Dart side uses Texture(textureId: ...) widget
+
+  Step 3.3: Frame timing and vsync [2 days]
+    - Synchronize Godot's frame rate with Flutter's vsync
+    - Handle frame drops gracefully (skip old frames)
+    - Implement frame pacing: notify Godot to start next frame when
+      Flutter has consumed the current one
+
+Phase 4: Integration and Testing (Week 4-5)
+----------------------------------------------
+
+  Step 4.1: End-to-end DMA-BUF pipeline test [2 days]
+    - Load a real Godot game (.pck) via libgodot.so
+    - Render via DMA-BUF -> EGLImage -> FlTextureGL -> Texture widget
+    - Measure FPS, latency, memory usage
+    - Compare with CPU readback baseline
+
+  Step 4.2: Fallback chain verification [2 days]
+    - Test on systems without DMA-BUF support (VM, old drivers)
+    - Verify automatic fallback to MODE_CPU_READBACK
+    - Test on NVIDIA proprietary (may need opaque fd fallback)
+    - Test on Wayland (EGL platform differences)
+
+  Step 4.3: Input forwarding [1 day]
+    - Forward mouse/touch events from Flutter to libgodot
+    - Map Flutter widget coordinates to Godot viewport coordinates
+    - Verify input works with DMA-BUF rendering
+
+  Step 4.4: Resize handling [1 day]
+    - Handle Flutter widget resize
+    - Recreate Godot's offscreen images + DMA-BUF fds
+    - Recreate EGLImages on Flutter side
+    - Verify no leaks during resize
+
+Phase 5: Optimization and Polish (Week 5-6)
+----------------------------------------------
+
+  Step 5.1: Performance optimization [2 days]
+    - Profile with perf/VTune
+    - Optimize format modifier selection for GPU-optimal tiling
+    - Consider triple buffering for smoother frame delivery
+    - Reduce latency with explicit sync
+
+  Step 5.2: NVIDIA proprietary driver support [2 days]
+    - Implement opaque fd fallback path
+    - Test with GL_EXT_memory_object_fd for Vulkan->GL import
+    - Verify on NVIDIA 535+ driver
+
+  Step 5.3: Documentation and examples [1 day]
+    - Update fludot README with DMA-BUF mode documentation
+    - Create example project demonstrating DMA-BUF integration
+    - Document driver requirements and fallback behavior
+
+Future Phase: Impeller/Vulkan Support
+----------------------------------------
+
+  When Flutter enables Impeller on Linux:
+    - Import DMA-BUF fd as VkImage in Impeller
+    - Use VK_KHR_external_semaphore_fd for sync
+    - Potentially contribute FlVulkanTexture to Flutter upstream
+    - Timeline: depends on Flutter team's Impeller Linux plans
+
+
+==============================================================================
+  10. COMPARISON TABLE: APPROACHES
+==============================================================================
+
++----------------------------+------------------+------------------+------------------+
+| Attribute                  | FlTextureGL      | DMA-BUF          | Pixel Buffer     |
+|                            | Shared Context   | Import/Export     | Copy             |
++----------------------------+------------------+------------------+------------------+
+| Zero-copy?                 | YES              | YES              | NO               |
+|                            |                  |                  | (GPU->CPU->GPU)  |
++----------------------------+------------------+------------------+------------------+
+| Godot renderer             | OpenGL only      | Vulkan or OpenGL | Any              |
++----------------------------+------------------+------------------+------------------+
+| Flutter renderer           | OpenGL (Skia)    | OpenGL or Vulkan | Any              |
++----------------------------+------------------+------------------+------------------+
+| Cross-API (Vk->GL)?       | NO               | YES              | YES (via CPU)    |
++----------------------------+------------------+------------------+------------------+
+| GPU driver requirements    | Shared EGL ctx   | DMA-BUF ext      | None             |
++----------------------------+------------------+------------------+------------------+
+| Complexity                 | Medium           | High             | Low              |
++----------------------------+------------------+------------------+------------------+
+| Latency                    | ~0 ms (same ctx) | ~0 ms (same GPU) | 2-8 ms (copy)    |
++----------------------------+------------------+------------------+------------------+
+| Bandwidth @ 1080p 60fps   | 0 MB/s           | 0 MB/s           | ~500 MB/s        |
++----------------------------+------------------+------------------+------------------+
+| Works on NVIDIA prop?      | YES              | PARTIAL          | YES              |
+|                            |                  | (needs fallback) |                  |
++----------------------------+------------------+------------------+------------------+
+| Works on Mesa (AMD/Intel)? | YES              | YES              | YES              |
++----------------------------+------------------+------------------+------------------+
+| Works on Wayland?          | YES              | YES              | YES              |
++----------------------------+------------------+------------------+------------------+
+| Future Impeller compat?    | NO (OpenGL only) | YES              | YES (slow)       |
++----------------------------+------------------+------------------+------------------+
+| Requires libgodot.so?      | YES              | YES              | YES              |
+|                            | (same process)   | (same or diff)   | (same or diff)   |
++----------------------------+------------------+------------------+------------------+
+| Implementation status      | Not started      | Godot side done  | Header only      |
+| in fludot                  |                  | Flutter side TODO |                  |
++----------------------------+------------------+------------------+------------------+
+
+RECOMMENDATION:
+
+  Short term: Implement shared GL context path (simplest, zero-copy, works
+              today on all GPUs).
+
+  Medium term: Add DMA-BUF path as the preferred mode when extensions are
+               available. This future-proofs for Impeller/Vulkan.
+
+  Always: Keep pixel buffer copy as the universal fallback.
+
+
+==============================================================================
+  11. OPEN QUESTIONS AND RISKS
+==============================================================================
+
+  Q1: Will Flutter ever support Impeller+Vulkan on Linux desktop?
+      The Flutter team has stated Impeller is the future for all platforms.
+      Impeller on Linux currently uses OpenGL. Vulkan backend exists but
+      is not the default. Timeline for Vulkan-default on Linux is unclear.
+      Impact: Path B (Vulkan->Vulkan) may not be needed for years.
+
+  Q2: How to handle NVIDIA proprietary driver limitations?
+      The proprietary driver does not support VK_EXT_external_memory_dma_buf.
+      Options:
+        (a) Use VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT instead
+            (works within same driver, not cross-API)
+        (b) Use GL_EXT_memory_object_fd for Vulkan->GL import
+        (c) Fall back to CPU readback on NVIDIA proprietary
+        (d) Recommend NVK (open-source) for full DMA-BUF support
+
+  Q3: Is VK_IMAGE_TILING_LINEAR a performance problem?
+      DMA-BUF with cross-API sharing typically requires linear tiling,
+      which is slower for GPU rendering than vendor-specific tiled formats.
+      Impact: Godot's rendering may be 10-30% slower for the offscreen
+      render target. Mitigated by using tiled modifiers when both sides
+      support the same modifier (e.g., both using Mesa).
+
+  Q4: Thread safety between Godot render thread and Flutter UI thread?
+      Godot renders on its own thread. Flutter composites on the platform
+      thread. The DMA-BUF fd and EGLImage creation need to happen on the
+      right threads with proper synchronization.
+      Mitigation: Use a lock-free producer-consumer ring buffer for
+      frame delivery. EGLImage can be created once and reused.
+
+  Q5: What about Wayland-specific considerations?
+      On Wayland, X11-based EGL may not be available. The plugin should
+      use EGL_PLATFORM_GBM_MESA or EGL_PLATFORM_WAYLAND for Godot's
+      context. Flutter's own EGL context handles this internally.
+      Impact: Need to test on Wayland compositors (GNOME, KDE, wlroots).
+
+  Q6: How large can frames get before DMA-BUF has issues?
+      DMA-BUF handles any size the GPU supports. At 4K (3840x2160)
+      with BGRA8, each frame is ~33 MB. With double buffering, that is
+      ~66 MB of GPU memory dedicated to the shared buffers.
+      Impact: Negligible for modern GPUs with 2+ GB VRAM.
+
+  Q7: Does this work in containers/VMs?
+      DMA-BUF requires access to /dev/dri/renderD128 (or similar).
+      In containers, this device must be passed through.
+      In VMs with GPU passthrough (VFIO), DMA-BUF works.
+      In VMs with virtio-gpu, DMA-BUF support depends on virgl/Venus.
+
+  RISK SUMMARY:
+
+    Risk                              Likelihood   Impact    Mitigation
+    ---------------------------------+-----------+---------+--------------------
+    NVIDIA prop driver incompatible    Medium       High      CPU readback fallback
+    Impeller/Vulkan on Linux delayed   High         Low       GL path works fine
+    Linear tiling perf regression      Medium       Medium    Modifier negotiation
+    Thread safety bugs                 Medium       High      Lock-free ring buffer
+    Wayland compat issues              Low          Medium    Test on Wayland early
+
+
+==============================================================================
+  12. REFERENCES
+==============================================================================
+
+  Linux Kernel DMA-BUF Documentation:
+    https://docs.kernel.org/driver-api/dma-buf.html
+
+  EGL_EXT_image_dma_buf_import (Khronos):
+    https://registry.khronos.org/EGL/extensions/EXT/EGL_EXT_image_dma_buf_import.txt
+
+  EGL_EXT_image_dma_buf_import_modifiers (Khronos):
+    https://github.com/KhronosGroup/EGL-Registry/blob/main/extensions/EXT/EGL_EXT_image_dma_buf_import_modifiers.txt
+
+  EGL_MESA_image_dma_buf_export (Khronos):
+    https://registry.khronos.org/EGL/extensions/MESA/EGL_MESA_image_dma_buf_export.txt
+
+  VK_EXT_external_memory_dma_buf (Vulkan):
+    https://registry.khronos.org/vulkan/specs/latest/man/html/VK_EXT_external_memory_dma_buf.html
+
+  VK_EXT_image_drm_format_modifier (Vulkan):
+    https://registry.khronos.org/vulkan/specs/latest/man/html/VK_EXT_image_drm_format_modifier.html
+
+  vkGetMemoryFdKHR (Vulkan):
+    https://registry.khronos.org/vulkan/specs/latest/man/html/vkGetMemoryFdKHR.html
+
+  Vulkan External Memory and Synchronization Guide:
+    https://docs.vulkan.org/guide/latest/extensions/external.html
+
+  Inter-Process Texture Sharing with DMA-BUF (tutorial):
+    https://blaztinn.gitlab.io/post/dmabuf-texture-sharing/
+
+  DMA-BUF Texture Sharing (example code):
+    https://github.com/walisser/dma-buf-texture-sharing
+
+  EGL and DMA-BUF Zero-Copy Tutorial:
+    https://eleni.mutantstargoat.com/hikiko/egl-dma-1/
+
+  NVIDIA DMA-BUF Support Discussion:
+    https://github.com/NVIDIA/open-gpu-kernel-modules/discussions/243
+
+  DRM Format Modifiers in NVK:
+    https://www.collabora.com/news-and-blog/news-and-events/implementing-drm-format-modifiers-in-nvk.html
+
+  Flutter Issue #117937 - External Texture Support for Vulkan:
+    https://github.com/flutter/flutter/issues/117937
+
+  Flutter Issue #144613 - Embedder API Vulkan External Resources:
+    https://github.com/flutter/flutter/issues/144613
+
+  Flutter Issue #137639 - Impeller Surface Textures in Vulkan:
+    https://github.com/flutter/flutter/issues/137639
+
+  Flutter Linux Embedder FlTextureGL:
+    https://api.flutter.dev/linux-embedder/struct___fl_texture_g_l_class.html
+
+  Flutter Impeller Documentation:
+    https://docs.flutter.dev/perf/impeller
+
+  Godot RenderingDevice API:
+    https://docs.godotengine.org/en/stable/classes/class_renderingdevice.html
+
+  NVIDIA gl_vk_simple_interop (Vulkan-OpenGL sharing example):
+    https://github.com/nvpro-samples/gl_vk_simple_interop
+
+  OBS Studio DMA-BUF Import PR:
+    https://github.com/obsproject/obs-studio/pull/3338
+
+  Fludot existing patches:
+    godot_patches/platform/linuxbsd/embedded/rendering_native_surface_linux_vulkan.h
+    godot_patches/platform/linuxbsd/embedded/rendering_native_surface_linux_vulkan.cpp
+    godot_patches/platform/linuxbsd/embedded/rendering_native_surface_linux_egl.h
+    godot_patches/platform/linuxbsd/embedded/rendering_native_surface_linux_egl.cpp
+    godot_patches/GODOT_LINUX_PATCH.md
+
+==============================================================================
+  END OF DOCUMENT
+==============================================================================
