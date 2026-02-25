@@ -17,6 +17,7 @@ export 'src/listen_callback.dart';
 
 /// Export platform implementations for plugin registration
 export 'src/linux.dart' show FlutterGodotLinux;
+export 'src/linux_native.dart' show FlutterGodotLinuxNative;
 export 'src/android.dart' show FlutterGodotAndroid;
 
 /// Compatibility handling for unsupported platforms
