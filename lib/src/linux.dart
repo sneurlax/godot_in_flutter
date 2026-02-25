@@ -1,7 +1,8 @@
 import 'dart:async';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/widgets.dart';
-import 'package:webview_cef/webview_cef.dart';
+import 'package:flutter_inappwebview/flutter_inappwebview.dart';
 
 import 'godot_player.dart';
 import 'platform_interface.dart';
@@ -9,12 +10,13 @@ import 'listen_callback.dart';
 import 'websocket_ipc.dart';
 import 'godot_http_server.dart';
 
-/// Linux platform implementation using WebView + WebSocket IPC.
+/// Linux platform implementation using InAppWebView (WPE WebKit) + WebSocket IPC.
 ///
 /// Architecture:
 /// 1. Flutter starts an HTTP server to serve Godot WASM export files
 /// 2. Flutter starts a WebSocket server for bidirectional IPC
-/// 3. A webview_cef WebView loads the Godot game from the HTTP server
+/// 3. A flutter_inappwebview InAppWebView (WPE WebKit, ~160MB) renders inline
+///    via texture, replacing the 1.4GB webview_cef/CEF dependency
 /// 4. JavaScript WebSocket bridge (injected in index.html) connects to
 ///    Flutter's WebSocket server
 /// 5. Godot -> Flutter: Godot print() -> JS console.log interception ->
@@ -35,14 +37,12 @@ final class FlutterGodotLinux extends FlutterGodotPlatform {
   /// WebSocket IPC server for robust bidirectional communication
   WebSocketIPC? _wsIPC;
 
-  /// WebSocket server port (0 = OS-assigned)
-
-  /// The webview_cef controller (set during widget initialization)
-  WebViewController? _webviewController;
+  /// The InAppWebView controller (set during widget initialization)
+  InAppWebViewController? _webviewController;
 
   /// Completer that resolves when the WebView controller is ready
-  final Completer<WebViewController> _controllerCompleter =
-      Completer<WebViewController>();
+  final Completer<InAppWebViewController> _controllerCompleter =
+      Completer<InAppWebViewController>();
 
   /// Completer that resolves when _initialize() finishes
   Completer<void>? _initCompleter;
@@ -57,7 +57,7 @@ final class FlutterGodotLinux extends FlutterGodotPlatform {
   /// Asset directory for Godot web export files
   static const String _webAssetDir = 'assets/godot_web';
 
-  /// Initialize the WebView-based Linux integration
+  /// Initialize the InAppWebView-based Linux integration
   Future<void> _initialize() async {
     if (_isInitialized) return;
     if (_isInitializing) {
@@ -70,7 +70,7 @@ final class FlutterGodotLinux extends FlutterGodotPlatform {
     _initCompleter = Completer<void>();
     try {
       debugPrint(
-          '[FlutterGodotLinux] Initializing WebView + WebSocket IPC...');
+          '[FlutterGodotLinux] Initializing InAppWebView + WebSocket IPC...');
 
       // Start the HTTP server to serve WASM files
       debugPrint('[FlutterGodotLinux] Starting HTTP server...');
@@ -85,9 +85,8 @@ final class FlutterGodotLinux extends FlutterGodotPlatform {
       debugPrint(
           '[FlutterGodotLinux] WebSocket IPC server running on port ${_wsIPC!.port}');
 
-      // Initialize WebviewManager (must be done before creating controllers)
-      debugPrint('[FlutterGodotLinux] Initializing WebviewManager...');
-      await WebviewManager().initialize();
+      // No need to initialize a WebviewManager - flutter_inappwebview handles
+      // its own initialization via the InAppWebView widget lifecycle.
 
       _isInitialized = true;
       _initCompleter?.complete();
@@ -101,8 +100,8 @@ final class FlutterGodotLinux extends FlutterGodotPlatform {
     }
   }
 
-  /// Set the WebView controller (called from the widget when it's created)
-  void setWebViewController(WebViewController controller) {
+  /// Set the InAppWebView controller (called from the widget when created)
+  void setWebViewController(InAppWebViewController controller) {
     _webviewController = controller;
     if (!_controllerCompleter.isCompleted) {
       _controllerCompleter.complete(controller);
@@ -139,7 +138,7 @@ final class FlutterGodotLinux extends FlutterGodotPlatform {
         return result;
       }
 
-      // Fallback: direct JavaScript injection via WebView controller
+      // Fallback: direct JavaScript injection via InAppWebView controller
       if (_webviewController != null) {
         final escaped = data.replaceAll('\\', '\\\\').replaceAll("'", "\\'");
         final js = '''
@@ -149,7 +148,7 @@ final class FlutterGodotLinux extends FlutterGodotPlatform {
             return true;
           })();
         ''';
-        await _webviewController!.evaluateJavascript(js);
+        await _webviewController!.evaluateJavascript(source: js);
         debugPrint(
             '[FlutterGodotLinux] Data sent to Godot via JS injection (fallback)');
         return true;
@@ -194,7 +193,7 @@ final class FlutterGodotLinux extends FlutterGodotPlatform {
             return true;
           })();
         ''';
-        await _webviewController!.evaluateJavascript(js);
+        await _webviewController!.evaluateJavascript(source: js);
       }
     } catch (error, stackTrace) {
       debugPrint('[FlutterGodotLinux] ERROR in forwardInputEvent: $error');
@@ -248,10 +247,9 @@ final class FlutterGodotLinux extends FlutterGodotPlatform {
       await _wsIPC?.stop();
       _wsIPC = null;
 
-      if (_webviewController != null) {
-        await _webviewController!.dispose();
-        _webviewController = null;
-      }
+      // InAppWebViewController doesn't need explicit disposal -
+      // it's managed by the InAppWebView widget lifecycle
+      _webviewController = null;
 
       await _httpServer.stop();
 

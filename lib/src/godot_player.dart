@@ -6,7 +6,7 @@ import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
-import 'package:webview_cef/webview_cef.dart';
+import 'package:flutter_inappwebview/flutter_inappwebview.dart';
 
 import '../flutter_godot.dart';
 import 'platform_interface.dart';
@@ -33,21 +33,21 @@ class _GodotPlayerState extends State<GodotPlayer> {
   bool _isReady = false;
   bool _isWebViewInitialized = false;
 
-  /// webview_cef controller for Linux WebView rendering
-  WebViewController? _webviewController;
+  /// The game URL to load (set after platform initialization)
+  String? _gameUrl;
 
   @override
   void initState() {
     super.initState();
     _setupGodotListener();
 
-    // On Linux, initialize the WebView
+    // On Linux, initialize the WebView platform
     if (Platform.isLinux) {
       _initializeWebView();
     }
   }
 
-  /// Initialize the CEF WebView for Linux
+  /// Initialize the InAppWebView for Linux
   Future<void> _initializeWebView() async {
     final platform = FlutterGodotPlatform.instance;
     if (platform is! FlutterGodotLinux) return;
@@ -58,45 +58,9 @@ class _GodotPlayerState extends State<GodotPlayer> {
       // Wait for the platform to be ready (HTTP + WebSocket servers started)
       await platform.ready;
 
-      // Create the WebView controller
-      _webviewController = WebviewManager().createWebView(
-        loading: const Text('Loading Godot...'),
-      );
-
-      // Set up event listener for console messages (monitoring/debug)
-      _webviewController!.setWebviewListener(WebviewEventsListener(
-        onTitleChanged: (title) {
-          debugPrint('[GodotPlayer] WebView title: $title');
-        },
-        onUrlChanged: (url) {
-          debugPrint('[GodotPlayer] WebView URL: $url');
-        },
-        onConsoleMessage:
-            (int level, String message, String source, int line) {
-          if (kDebugMode) {
-            debugPrint('[GodotPlayer] Console [$level]: $message');
-          }
-        },
-        onLoadStart: (controller, url) {
-          debugPrint('[GodotPlayer] WebView load start: $url');
-        },
-        onLoadEnd: (controller, url) {
-          debugPrint('[GodotPlayer] WebView load end: $url');
-          if (mounted) {
-            setState(() {
-              _isReady = true;
-            });
-          }
-        },
-      ));
-
-      // Initialize the WebView with the game URL (includes ?ws_port= parameter)
-      final gameUrl = platform.gameUrl;
-      debugPrint('[GodotPlayer] Loading game from: $gameUrl');
-      await _webviewController!.initialize(gameUrl);
-
-      // Register the controller with the platform (for JS injection fallback)
-      platform.setWebViewController(_webviewController!);
+      // Get the game URL (includes ?ws_port= parameter)
+      _gameUrl = platform.gameUrl;
+      debugPrint('[GodotPlayer] Game URL ready: $_gameUrl');
 
       if (mounted) {
         setState(() {
@@ -104,7 +68,7 @@ class _GodotPlayerState extends State<GodotPlayer> {
         });
       }
 
-      debugPrint('[GodotPlayer] WebView initialized successfully');
+      debugPrint('[GodotPlayer] WebView initialization complete');
     } catch (e, st) {
       debugPrint('[GodotPlayer] WebView initialization error: $e');
       debugPrint('[GodotPlayer] Stack trace: $st');
@@ -130,7 +94,6 @@ class _GodotPlayerState extends State<GodotPlayer> {
   void dispose() {
     debugPrint('[GodotPlayer] Disposing...');
     _godotDataSubscription?.cancel();
-    _webviewController?.dispose();
     super.dispose();
   }
 
@@ -200,7 +163,7 @@ class _GodotPlayerState extends State<GodotPlayer> {
       return _buildAndroidView();
     }
 
-    // Linux: use WebView to render Godot WASM
+    // Linux: use InAppWebView to render Godot WASM
     if (Platform.isLinux) {
       return _buildLinuxWebView();
     }
@@ -209,19 +172,64 @@ class _GodotPlayerState extends State<GodotPlayer> {
     return _buildUnsupportedWidget();
   }
 
-  /// Build the Linux WebView widget that displays Godot running as WASM
+  /// Build the Linux InAppWebView widget that displays Godot running as WASM.
+  ///
+  /// Uses flutter_inappwebview with WPE WebKit backend, which renders to a
+  /// texture for true inline embedding in the Flutter widget tree (~160MB
+  /// vs 1.4GB for CEF).
   Widget _buildLinuxWebView() {
-    if (_webviewController == null || !_isWebViewInitialized) {
+    if (!_isWebViewInitialized || _gameUrl == null) {
       return _buildLoadingWidget();
     }
 
-    return ValueListenableBuilder(
-      valueListenable: _webviewController!,
-      builder: (context, bool isReady, child) {
-        if (isReady) {
-          return _webviewController!.webviewWidget;
+    return InAppWebView(
+      initialUrlRequest: URLRequest(
+        url: WebUri(_gameUrl!),
+      ),
+      initialSettings: InAppWebViewSettings(
+        // Enable JavaScript (required for Godot WASM)
+        javaScriptEnabled: true,
+        // Allow mixed content for localhost WebSocket connections
+        mixedContentMode: MixedContentMode.MIXED_CONTENT_ALWAYS_ALLOW,
+        // Disable zoom controls (Godot handles its own viewport)
+        supportZoom: false,
+        // Allow file access from file URLs
+        allowFileAccessFromFileURLs: true,
+        allowUniversalAccessFromFileURLs: true,
+        // Transparent background
+        transparentBackground: true,
+      ),
+      onWebViewCreated: (InAppWebViewController controller) {
+        debugPrint('[GodotPlayer] InAppWebView created');
+        // Register with the platform for JS injection fallback
+        final platform = FlutterGodotPlatform.instance;
+        if (platform is FlutterGodotLinux) {
+          platform.setWebViewController(controller);
         }
-        return _webviewController!.loadingWidget;
+      },
+      onLoadStart: (controller, url) {
+        debugPrint('[GodotPlayer] WebView load start: $url');
+      },
+      onLoadStop: (controller, url) {
+        debugPrint('[GodotPlayer] WebView load end: $url');
+        if (mounted) {
+          setState(() {
+            _isReady = true;
+          });
+        }
+      },
+      onConsoleMessage: (controller, consoleMessage) {
+        if (kDebugMode) {
+          debugPrint(
+              '[GodotPlayer] Console [${consoleMessage.messageLevel}]: ${consoleMessage.message}');
+        }
+      },
+      onLoadError: (controller, url, code, message) {
+        debugPrint('[GodotPlayer] Load error: $code - $message ($url)');
+      },
+      onReceivedError: (controller, request, error) {
+        debugPrint(
+            '[GodotPlayer] Received error: ${error.type} - ${error.description}');
       },
     );
   }
